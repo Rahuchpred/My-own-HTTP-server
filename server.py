@@ -14,9 +14,14 @@ class HTTPServer:
     def __init__(self, host: str = HOST, port: int = PORT, router: Router | None = None) -> None:
         self.host = host
         self.port = port
-        self.router = router or Router()
+        self.router = router or self._build_default_router()
         self._server_socket: socket.socket | None = None
         self._running = False
+
+    def _build_default_router(self) -> Router:
+        router = Router()
+        router.add_route("GET", "/", home)
+        return router
 
     def start(self) -> None:
         """Start listening and process connections sequentially."""
@@ -60,9 +65,10 @@ class HTTPServer:
             write_http_response(client_socket, response.to_bytes())
 
     def _dispatch(self, request: HTTPRequest) -> HTTPResponse:
-        if request.method == "GET" and request.path == "/":
-            return home(request)
-        return HTTPResponse(status_code=404, body="Not Found")
+        handler = self.router.resolve(request.method, request.path)
+        if handler is None:
+            return HTTPResponse(status_code=404, body="Not Found")
+        return handler(request)
 
 
 if __name__ == "__main__":
