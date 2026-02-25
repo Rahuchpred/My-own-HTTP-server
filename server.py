@@ -1,6 +1,7 @@
 """Main HTTP server entry point and connection lifecycle orchestration."""
 
 import socket
+import threading
 
 from config import HOST, PORT
 from handlers.example_handlers import home, serve_static, submit
@@ -17,6 +18,8 @@ class HTTPServer:
         self.router = router or self._build_default_router()
         self._server_socket: socket.socket | None = None
         self._running = False
+        self._threads: list[threading.Thread] = []
+        self._lock = threading.Lock()
 
     def _build_default_router(self) -> Router:
         router = Router()
@@ -25,24 +28,34 @@ class HTTPServer:
         return router
 
     def start(self) -> None:
-        """Start listening and process connections sequentially."""
+        """Start listening and process each client in a dedicated thread."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
             self._server_socket = server_socket
             server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server_socket.bind((self.host, self.port))
-            server_socket.listen(5)
+            server_socket.listen(128)
             server_socket.settimeout(0.2)
             self.port = server_socket.getsockname()[1]
 
             self._running = True
             while self._running:
                 try:
-                    client_socket, _address = server_socket.accept()
+                    client_socket, address = server_socket.accept()
                 except socket.timeout:
                     continue
                 except OSError:
                     break
-                self._handle_client(client_socket)
+
+                client_thread = threading.Thread(
+                    target=self._handle_client,
+                    args=(client_socket, address),
+                    daemon=True,
+                )
+                with self._lock:
+                    self._threads.append(client_thread)
+                client_thread.start()
+
+            self._join_client_threads()
 
     def stop(self) -> None:
         self._running = False
@@ -50,7 +63,16 @@ class HTTPServer:
             self._server_socket.close()
             self._server_socket = None
 
-    def _handle_client(self, client_socket: socket.socket) -> None:
+    def _join_client_threads(self) -> None:
+        with self._lock:
+            threads = list(self._threads)
+            self._threads.clear()
+
+        for thread in threads:
+            thread.join(timeout=1.0)
+
+    def _handle_client(self, client_socket: socket.socket, address: tuple[str, int]) -> None:
+        _ = address
         with client_socket:
             raw_request = read_http_request(client_socket)
             if not raw_request:
