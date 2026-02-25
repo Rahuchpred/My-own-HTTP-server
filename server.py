@@ -159,22 +159,37 @@ class HTTPServer:
                     return
 
     def _dispatch(self, request: HTTPRequest) -> HTTPResponse:
-        allowed_methods = {"GET", "POST"}
+        allowed_methods = {"GET", "HEAD", "POST"}
         if request.method not in allowed_methods:
             return HTTPResponse(
                 status_code=405,
-                headers={"Allow": "GET, POST"},
+                headers={"Allow": "GET, HEAD, POST"},
                 body="Method Not Allowed",
             )
 
         if request.path.startswith("/static/"):
-            if request.method != "GET":
+            if request.method not in {"GET", "HEAD"}:
                 return HTTPResponse(
                     status_code=405,
-                    headers={"Allow": "GET"},
+                    headers={"Allow": "GET, HEAD"},
                     body="Method Not Allowed",
                 )
+            if request.method == "HEAD":
+                get_request = self._request_with_method(request, method="GET")
+                return self._as_head_response(serve_static(get_request))
             return serve_static(request)
+
+        if request.method == "HEAD":
+            handler = self.router.resolve("GET", request.path)
+            if handler is None:
+                return self._as_head_response(HTTPResponse(status_code=404, body="Not Found"))
+            try:
+                return self._as_head_response(handler(request))
+            except Exception:
+                logger.exception("Unhandled error in HEAD route handler")
+                return self._as_head_response(
+                    HTTPResponse(status_code=500, body="Internal Server Error")
+                )
 
         handler = self.router.resolve(request.method, request.path)
         if handler is None:
@@ -185,6 +200,41 @@ class HTTPServer:
         except Exception:
             logger.exception("Unhandled error in route handler")
             return HTTPResponse(status_code=500, body="Internal Server Error")
+
+    def _request_with_method(self, request: HTTPRequest, method: str) -> HTTPRequest:
+        return HTTPRequest(
+            method=method,
+            path=request.path,
+            raw_target=request.raw_target,
+            http_version=request.http_version,
+            headers=dict(request.headers),
+            body=request.body,
+            query_params=dict(request.query_params),
+            keep_alive=request.keep_alive,
+            transfer_encoding=request.transfer_encoding,
+        )
+
+    def _as_head_response(self, get_response: HTTPResponse) -> HTTPResponse:
+        headers = dict(get_response.headers)
+        if get_response.stream is not None:
+            headers.setdefault("Transfer-Encoding", "chunked")
+            return HTTPResponse(
+                status_code=get_response.status_code,
+                reason_phrase=get_response.reason_phrase,
+                headers=headers,
+                body=b"",
+            )
+
+        body_bytes = get_response.body
+        if isinstance(body_bytes, str):
+            body_bytes = body_bytes.encode("utf-8")
+        return HTTPResponse(
+            status_code=get_response.status_code,
+            reason_phrase=get_response.reason_phrase,
+            headers=headers,
+            body=b"",
+            content_length_override=len(body_bytes),
+        )
 
 
 if __name__ == "__main__":

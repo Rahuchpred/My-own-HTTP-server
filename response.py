@@ -26,6 +26,7 @@ class HTTPResponse:
     body: bytes | str = b""
     stream: Iterable[bytes] | None = None
     should_close: bool = False
+    content_length_override: int | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.body, str):
@@ -51,7 +52,10 @@ class HTTPResponse:
             normalized_headers["Transfer-Encoding"] = "chunked"
         else:
             payload = self.body
-            normalized_headers["Content-Length"] = str(len(payload))
+            content_length = self.content_length_override
+            if content_length is None:
+                content_length = len(payload)
+            normalized_headers["Content-Length"] = str(content_length)
 
         header_lines = [f"HTTP/1.1 {self.status_code} {reason}"]
         header_lines.extend(f"{key}: {value}" for key, value in normalized_headers.items())
