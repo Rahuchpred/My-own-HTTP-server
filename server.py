@@ -3,7 +3,7 @@
 import socket
 
 from config import HOST, PORT
-from handlers.example_handlers import home, serve_static
+from handlers.example_handlers import home, serve_static, submit
 from request import HTTPRequest
 from response import HTTPResponse
 from router import Router
@@ -21,6 +21,7 @@ class HTTPServer:
     def _build_default_router(self) -> Router:
         router = Router()
         router.add_route("GET", "/", home)
+        router.add_route("POST", "/submit", submit)
         return router
 
     def start(self) -> None:

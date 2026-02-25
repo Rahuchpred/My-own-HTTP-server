@@ -16,7 +16,12 @@ def home(request: HTTPRequest) -> HTTPResponse:
 
 
 def submit(request: HTTPRequest) -> HTTPResponse:
-    raise NotImplementedError("Implemented in phase P07")
+    body_text = request.body.decode("utf-8", errors="replace")
+    return HTTPResponse(
+        status_code=200,
+        headers={"Content-Type": "text/plain; charset=utf-8"},
+        body=f"Received POST body: {body_text}",
+    )
 
 
 
