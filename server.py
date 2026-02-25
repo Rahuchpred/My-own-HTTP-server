@@ -2,14 +2,15 @@
 
 import logging
 import socket
-import threading
 
 from config import (
     HOST,
     KEEPALIVE_TIMEOUT_SECS,
     MAX_KEEPALIVE_REQUESTS,
     PORT,
+    REQUEST_QUEUE_SIZE,
     SOCKET_TIMEOUT_SECS,
+    WORKER_COUNT,
 )
 from handlers.example_handlers import home, serve_static, submit
 from request import HTTPRequest
@@ -23,19 +24,28 @@ from socket_handler import (
     read_http_request_message,
     write_http_response,
 )
+from thread_pool import ThreadPool
 
 logger = logging.getLogger(__name__)
 
 
 class HTTPServer:
-    def __init__(self, host: str = HOST, port: int = PORT, router: Router | None = None) -> None:
+    def __init__(
+        self,
+        host: str = HOST,
+        port: int = PORT,
+        router: Router | None = None,
+        worker_count: int = WORKER_COUNT,
+        request_queue_size: int = REQUEST_QUEUE_SIZE,
+    ) -> None:
         self.host = host
         self.port = port
         self.router = router or self._build_default_router()
+        self.worker_count = worker_count
+        self.request_queue_size = request_queue_size
         self._server_socket: socket.socket | None = None
+        self._pool: ThreadPool | None = None
         self._running = False
-        self._threads: list[threading.Thread] = []
-        self._lock = threading.Lock()
 
     def _build_default_router(self) -> Router:
         router = Router()
@@ -44,7 +54,7 @@ class HTTPServer:
         return router
 
     def start(self) -> None:
-        """Start listening and process each client in a dedicated thread."""
+        """Start listening and process clients through a fixed worker pool."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
             self._server_socket = server_socket
             server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -52,40 +62,48 @@ class HTTPServer:
             server_socket.listen(128)
             server_socket.settimeout(0.2)
             self.port = server_socket.getsockname()[1]
+            self._pool = ThreadPool(
+                worker_count=self.worker_count,
+                queue_size=self.request_queue_size,
+                handler=self._handle_client,
+            )
+            self._pool.start()
 
             self._running = True
-            while self._running:
-                try:
-                    client_socket, address = server_socket.accept()
-                except socket.timeout:
-                    continue
-                except OSError:
-                    break
+            try:
+                while self._running:
+                    try:
+                        client_socket, address = server_socket.accept()
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
 
-                client_thread = threading.Thread(
-                    target=self._handle_client,
-                    args=(client_socket, address),
-                    daemon=True,
-                )
-                with self._lock:
-                    self._threads.append(client_thread)
-                client_thread.start()
-
-            self._join_client_threads()
+                    if self._pool is None or not self._pool.submit(client_socket, address):
+                        self._send_queue_full_response(client_socket)
+            finally:
+                if self._pool is not None:
+                    self._pool.shutdown()
+                    self._pool = None
 
     def stop(self) -> None:
         self._running = False
         if self._server_socket is not None:
             self._server_socket.close()
             self._server_socket = None
+        if self._pool is not None:
+            self._pool.shutdown()
+            self._pool = None
 
-    def _join_client_threads(self) -> None:
-        with self._lock:
-            threads = list(self._threads)
-            self._threads.clear()
-
-        for thread in threads:
-            thread.join(timeout=1.0)
+    def _send_queue_full_response(self, client_socket: socket.socket) -> None:
+        with client_socket:
+            response = HTTPResponse(
+                status_code=503,
+                reason_phrase="Service Unavailable",
+                headers={"Connection": "close"},
+                body="Service Unavailable",
+            )
+            write_http_response(client_socket, response.to_bytes())
 
     def _handle_client(self, client_socket: socket.socket, address: tuple[str, int]) -> None:
         with client_socket:
