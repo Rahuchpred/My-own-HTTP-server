@@ -70,8 +70,10 @@ Use the helper script to run phase-specific checks, then commit with fixed Conve
 ```bash
 scripts/autocommit_phase.sh P00
 scripts/autocommit_phase.sh P01
-# ...
 scripts/autocommit_phase.sh P10
+scripts/autocommit_phase.sh V20
+# ...
+scripts/autocommit_phase.sh V39
 ```
 
 By default, the script pushes the active branch after a successful commit.

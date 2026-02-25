@@ -3,7 +3,7 @@ set -euo pipefail
 
 phase="${1:-}"
 if [[ -z "$phase" ]]; then
-  echo "Usage: $0 P00|P01|...|P10"
+  echo "Usage: $0 P00|...|P10|V20|...|V28|V30|...|V39"
   exit 1
 fi
 
@@ -68,6 +68,70 @@ case "$phase" in
     ;;
   P10)
     message="refactor(core): clean modules docs and final polish"
+    phase_tests=("$py_bin" -m pytest -q)
+    ;;
+  V20)
+    message="feat(core): add keep-alive request loop per connection"
+    phase_tests=("$py_bin" -m pytest -q tests/test_v20_keepalive.py)
+    ;;
+  V21)
+    message="feat(pool): add bounded thread pool and accept queue"
+    phase_tests=("$py_bin" -m pytest -q tests/test_v21_thread_pool.py)
+    ;;
+  V22)
+    message="feat(request): add chunked transfer request decoding"
+    phase_tests=("$py_bin" -m pytest -q tests/test_v22_chunked_request.py)
+    ;;
+  V23)
+    message="feat(response): add chunked transfer response streaming"
+    phase_tests=("$py_bin" -m pytest -q tests/test_v23_chunked_response.py)
+    ;;
+  V24)
+    message="feat(protocol): add date server and connection headers"
+    phase_tests=("$py_bin" -m pytest -q tests/test_v24_protocol_headers.py)
+    ;;
+  V25)
+    message="feat(routes): add head behavior and method rules"
+    phase_tests=("$py_bin" -m pytest -q tests/test_v25_head_and_methods.py)
+    ;;
+  V26)
+    message="feat(metrics): add access logging and metrics endpoint"
+    phase_tests=("$py_bin" -m pytest -q tests/test_v26_metrics.py)
+    ;;
+  V27)
+    message="test(protocol): add keep-alive chunked and queue tests"
+    phase_tests=("$py_bin" -m pytest -q tests/test_v27_protocol_regression.py)
+    ;;
+  V28)
+    message="docs(v2): document protocol behavior and tuning"
+    phase_tests=("$py_bin" -m pytest -q tests/test_v2_docs.py)
+    ;;
+  V30)
+    message="feat(static): add etag last-modified and 304 responses"
+    phase_tests=("$py_bin" -m pytest -q tests/test_v30_static_cache_validators.py)
+    ;;
+  V31)
+    message="feat(load): add load generator for concurrency testing"
+    phase_tests=("$py_bin" -m pytest -q tests/test_v31_loadgen.py)
+    ;;
+  V32)
+    message="feat(dashboard): add live metrics dashboard page"
+    phase_tests=("$py_bin" -m pytest -q tests/test_v32_dashboard.py)
+    ;;
+  V33)
+    message="perf(server): tune worker and keep-alive defaults"
+    phase_tests=("$py_bin" -m pytest -q tests/test_v33_perf_tuning.py)
+    ;;
+  V34)
+    message="test(perf): add repeatable stress smoke checks"
+    phase_tests=("$py_bin" -m pytest -q tests/test_v34_perf_smoke.py)
+    ;;
+  V35)
+    message="docs(demo): add final demo runbook and commands"
+    phase_tests=("$py_bin" -m pytest -q tests/test_v35_demo_runbook.py)
+    ;;
+  V39)
+    message="refactor(core): finalize cleanup and full validation"
     phase_tests=("$py_bin" -m pytest -q)
     ;;
   *)
