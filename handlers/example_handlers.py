@@ -14,7 +14,6 @@ def home(request: HTTPRequest) -> HTTPResponse:
     )
 
 
-
 def submit(request: HTTPRequest) -> HTTPResponse:
     body_text = request.body.decode("utf-8", errors="replace")
     return HTTPResponse(
@@ -23,6 +22,15 @@ def submit(request: HTTPRequest) -> HTTPResponse:
         body=f"Received POST body: {body_text}",
     )
 
+
+def stream_demo(request: HTTPRequest) -> HTTPResponse:
+    _ = request
+    chunks = [b"chunk-one\n", b"chunk-two\n", b"chunk-three\n"]
+    return HTTPResponse(
+        status_code=200,
+        headers={"Content-Type": "text/plain; charset=utf-8"},
+        stream=chunks,
+    )
 
 
 def serve_static(request: HTTPRequest) -> HTTPResponse:
