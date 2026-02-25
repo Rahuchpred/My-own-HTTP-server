@@ -8,4 +8,5 @@ def read_http_request(client_socket: socket.socket) -> bytes:
 
 
 def write_http_response(client_socket: socket.socket, payload: bytes) -> None:
-    raise NotImplementedError("Implemented in phase P01")
+    """Write the complete response payload to a client socket."""
+    client_socket.sendall(payload)
