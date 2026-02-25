@@ -3,7 +3,7 @@
 import socket
 
 from config import HOST, PORT
-from handlers.example_handlers import home
+from handlers.example_handlers import home, serve_static
 from request import HTTPRequest
 from response import HTTPResponse
 from router import Router
@@ -65,6 +65,9 @@ class HTTPServer:
             write_http_response(client_socket, response.to_bytes())
 
     def _dispatch(self, request: HTTPRequest) -> HTTPResponse:
+        if request.path.startswith("/static/"):
+            return serve_static(request)
+
         handler = self.router.resolve(request.method, request.path)
         if handler is None:
             return HTTPResponse(status_code=404, body="Not Found")
