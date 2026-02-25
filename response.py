@@ -2,6 +2,9 @@
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from email.utils import formatdate
+
+from config import SERVER_NAME
 
 REASON_PHRASES: dict[int, str] = {
     200: "OK",
@@ -33,6 +36,11 @@ class HTTPResponse:
         reason = self.reason_phrase or REASON_PHRASES.get(self.status_code, "Unknown")
         normalized_headers = dict(self.headers)
 
+        normalized_headers.setdefault(
+            "Date",
+            formatdate(timeval=None, localtime=False, usegmt=True),
+        )
+        normalized_headers.setdefault("Server", SERVER_NAME)
         normalized_headers.setdefault("Content-Type", "text/plain; charset=utf-8")
         payload: bytes
         if self.stream is not None:
