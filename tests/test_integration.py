@@ -57,6 +57,31 @@ def test_concurrent_requests() -> None:
 
 
 
+def test_unknown_route_returns_404() -> None:
+    server, thread = _start_server()
+
+    payload = b"GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    response = _send_raw(server.host, server.port, payload)
+
+    _stop_server(server, thread)
+
+    assert response.startswith(b"HTTP/1.1 404 Not Found")
+
+
+
+def test_static_route_serves_file() -> None:
+    server, thread = _start_server()
+
+    payload = b"GET /static/test.html HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    response = _send_raw(server.host, server.port, payload)
+
+    _stop_server(server, thread)
+
+    assert response.startswith(b"HTTP/1.1 200 OK")
+    assert b"Content-Type: text/html" in response
+
+
+
 def test_malformed_request_returns_400() -> None:
     server, thread = _start_server()
 
