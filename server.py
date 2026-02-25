@@ -1,14 +1,24 @@
 """Main HTTP server entry point and connection lifecycle orchestration."""
 
+import logging
 import socket
 import threading
 
-from config import HOST, PORT
+from config import HOST, PORT, SOCKET_TIMEOUT_SECS
 from handlers.example_handlers import home, serve_static, submit
 from request import HTTPRequest
 from response import HTTPResponse
 from router import Router
-from socket_handler import read_http_request, write_http_response
+from socket_handler import (
+    HeaderTooLargeError,
+    MalformedRequestError,
+    PayloadTooLargeError,
+    SocketTimeoutError,
+    read_http_request,
+    write_http_response,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class HTTPServer:
@@ -72,32 +82,61 @@ class HTTPServer:
             thread.join(timeout=1.0)
 
     def _handle_client(self, client_socket: socket.socket, address: tuple[str, int]) -> None:
-        _ = address
         with client_socket:
-            raw_request = read_http_request(client_socket)
-            if not raw_request:
-                return
-
+            client_socket.settimeout(SOCKET_TIMEOUT_SECS)
             try:
-                request = HTTPRequest.from_bytes(raw_request)
-            except ValueError:
+                raw_request = read_http_request(client_socket)
+            except PayloadTooLargeError:
+                response = HTTPResponse(status_code=413, body="Payload Too Large")
+            except (HeaderTooLargeError, MalformedRequestError, SocketTimeoutError):
                 response = HTTPResponse(status_code=400, body="Bad Request")
+            except OSError:
+                return
             else:
-                response = self._dispatch(request)
+                if not raw_request:
+                    return
 
+                try:
+                    request = HTTPRequest.from_bytes(raw_request)
+                except ValueError:
+                    response = HTTPResponse(status_code=400, body="Bad Request")
+                else:
+                    response = self._dispatch(request)
+
+            logger.info("%s:%s -> %s", address[0], address[1], response.status_code)
             write_http_response(client_socket, response.to_bytes())
 
     def _dispatch(self, request: HTTPRequest) -> HTTPResponse:
+        allowed_methods = {"GET", "POST"}
+        if request.method not in allowed_methods:
+            return HTTPResponse(
+                status_code=405,
+                headers={"Allow": "GET, POST"},
+                body="Method Not Allowed",
+            )
+
         if request.path.startswith("/static/"):
+            if request.method != "GET":
+                return HTTPResponse(
+                    status_code=405,
+                    headers={"Allow": "GET"},
+                    body="Method Not Allowed",
+                )
             return serve_static(request)
 
         handler = self.router.resolve(request.method, request.path)
         if handler is None:
             return HTTPResponse(status_code=404, body="Not Found")
-        return handler(request)
+
+        try:
+            return handler(request)
+        except Exception:
+            logger.exception("Unhandled error in route handler")
+            return HTTPResponse(status_code=500, body="Internal Server Error")
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     server = HTTPServer()
     try:
         server.start()
