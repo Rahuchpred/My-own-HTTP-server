@@ -44,13 +44,38 @@ def _extract_content_length(header_bytes: bytes) -> int:
     return 0
 
 
-def read_http_request(client_socket: socket.socket) -> bytes:
-    """Read a single HTTP/1.1 request from the client socket."""
-    buffer = bytearray()
+def read_http_request_message(
+    client_socket: socket.socket,
+    initial_buffer: bytes = b"",
+) -> tuple[bytes, bytes]:
+    """Read one HTTP/1.1 request and return (request_bytes, leftover_bytes)."""
+    buffer = bytearray(initial_buffer)
     header_end_index = -1
     expected_body_length = 0
 
     while True:
+        if header_end_index == -1:
+            header_end_index = buffer.find(b"\r\n\r\n")
+            if header_end_index != -1:
+                header_section_length = header_end_index + 4
+                if header_section_length > MAX_HEADER_BYTES:
+                    raise HeaderTooLargeError("Headers exceeded MAX_HEADER_BYTES")
+                expected_body_length = _extract_content_length(bytes(buffer[:header_end_index]))
+                if expected_body_length > MAX_BODY_BYTES:
+                    raise PayloadTooLargeError("Body exceeded MAX_BODY_BYTES")
+
+        if header_end_index != -1:
+            request_length = header_end_index + 4 + expected_body_length
+            if len(buffer) >= request_length:
+                request_bytes = bytes(buffer[:request_length])
+                leftover_bytes = bytes(buffer[request_length:])
+                return request_bytes, leftover_bytes
+
+        if len(buffer) > MAX_REQUEST_BYTES:
+            raise PayloadTooLargeError("Request exceeded MAX_REQUEST_BYTES")
+        if header_end_index == -1 and len(buffer) > MAX_HEADER_BYTES:
+            raise HeaderTooLargeError("Headers exceeded MAX_HEADER_BYTES")
+
         try:
             chunk = client_socket.recv(BUFFER_SIZE)
         except socket.timeout as exc:
@@ -58,41 +83,16 @@ def read_http_request(client_socket: socket.socket) -> bytes:
 
         if not chunk:
             if not buffer:
-                return b""
-            break
+                return b"", b""
+            raise MalformedRequestError("Connection closed before request completed")
 
         buffer.extend(chunk)
-        if len(buffer) > MAX_REQUEST_BYTES:
-            raise PayloadTooLargeError("Request exceeded MAX_REQUEST_BYTES")
 
-        if header_end_index == -1:
-            header_end_index = buffer.find(b"\r\n\r\n")
-            if header_end_index == -1:
-                if len(buffer) > MAX_HEADER_BYTES:
-                    raise HeaderTooLargeError("Headers exceeded MAX_HEADER_BYTES")
-                continue
 
-            header_section_length = header_end_index + 4
-            if header_section_length > MAX_HEADER_BYTES:
-                raise HeaderTooLargeError("Headers exceeded MAX_HEADER_BYTES")
-
-            expected_body_length = _extract_content_length(bytes(buffer[:header_end_index]))
-            if expected_body_length > MAX_BODY_BYTES:
-                raise PayloadTooLargeError("Body exceeded MAX_BODY_BYTES")
-
-        body_bytes_received = len(buffer) - (header_end_index + 4)
-        if body_bytes_received >= expected_body_length:
-            break
-
-    if header_end_index == -1:
-        raise MalformedRequestError("Header terminator not found")
-
-    body_bytes_received = len(buffer) - (header_end_index + 4)
-    if body_bytes_received < expected_body_length:
-        raise MalformedRequestError("Body shorter than Content-Length")
-
-    request_length = header_end_index + 4 + expected_body_length
-    return bytes(buffer[:request_length])
+def read_http_request(client_socket: socket.socket) -> bytes:
+    """Compatibility helper to read a single request without carry-over."""
+    request_bytes, _leftover = read_http_request_message(client_socket)
+    return request_bytes
 
 
 def write_http_response(client_socket: socket.socket, payload: bytes) -> None:

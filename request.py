@@ -9,9 +9,12 @@ class HTTPRequest:
     method: str
     path: str
     http_version: str
+    raw_target: str = "/"
     headers: dict[str, str] = field(default_factory=dict)
     body: bytes = b""
     query_params: dict[str, list[str]] = field(default_factory=dict)
+    keep_alive: bool = False
+    transfer_encoding: str | None = None
 
     @classmethod
     def from_bytes(cls, raw: bytes) -> "HTTPRequest":
@@ -49,6 +52,11 @@ class HTTPRequest:
                 raise ValueError("Header name cannot be empty")
             headers[header_name] = value.strip()
 
+        transfer_encoding = headers.get("transfer-encoding")
+        if transfer_encoding and "chunked" in transfer_encoding.lower():
+            # Chunked request decoding is implemented in V22.
+            raise ValueError("Chunked request bodies are not yet supported")
+
         if "content-length" in headers:
             content_length_value = headers["content-length"]
             try:
@@ -62,11 +70,26 @@ class HTTPRequest:
             if len(body) != expected_body_length:
                 raise ValueError("Body length does not match Content-Length")
 
+        connection_header = headers.get("connection", "")
+        keep_alive = _is_keep_alive(http_version, connection_header)
+
         return cls(
             method=method.upper(),
             path=path,
+            raw_target=target,
             http_version=http_version,
             headers=headers,
             body=body,
             query_params=query_params,
+            keep_alive=keep_alive,
+            transfer_encoding=transfer_encoding,
         )
+
+
+def _is_keep_alive(http_version: str, connection_header: str) -> bool:
+    token = connection_header.lower()
+    if http_version == "HTTP/1.1":
+        return "close" not in token
+    if http_version == "HTTP/1.0":
+        return "keep-alive" in token
+    return False

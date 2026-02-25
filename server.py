@@ -4,7 +4,13 @@ import logging
 import socket
 import threading
 
-from config import HOST, PORT, SOCKET_TIMEOUT_SECS
+from config import (
+    HOST,
+    KEEPALIVE_TIMEOUT_SECS,
+    MAX_KEEPALIVE_REQUESTS,
+    PORT,
+    SOCKET_TIMEOUT_SECS,
+)
 from handlers.example_handlers import home, serve_static, submit
 from request import HTTPRequest
 from response import HTTPResponse
@@ -14,7 +20,7 @@ from socket_handler import (
     MalformedRequestError,
     PayloadTooLargeError,
     SocketTimeoutError,
-    read_http_request,
+    read_http_request_message,
     write_http_response,
 )
 
@@ -83,16 +89,25 @@ class HTTPServer:
 
     def _handle_client(self, client_socket: socket.socket, address: tuple[str, int]) -> None:
         with client_socket:
-            client_socket.settimeout(SOCKET_TIMEOUT_SECS)
-            try:
-                raw_request = read_http_request(client_socket)
-            except PayloadTooLargeError:
-                response = HTTPResponse(status_code=413, body="Payload Too Large")
-            except (HeaderTooLargeError, MalformedRequestError, SocketTimeoutError):
-                response = HTTPResponse(status_code=400, body="Bad Request")
-            except OSError:
-                return
-            else:
+            client_socket.settimeout(min(SOCKET_TIMEOUT_SECS, KEEPALIVE_TIMEOUT_SECS))
+            request_count = 0
+            carry = b""
+            while request_count < MAX_KEEPALIVE_REQUESTS:
+                try:
+                    raw_request, carry = read_http_request_message(client_socket, carry)
+                except PayloadTooLargeError:
+                    response = HTTPResponse(status_code=413, body="Payload Too Large")
+                    response.headers.setdefault("Connection", "close")
+                    write_http_response(client_socket, response.to_bytes())
+                    return
+                except (HeaderTooLargeError, MalformedRequestError, SocketTimeoutError):
+                    response = HTTPResponse(status_code=400, body="Bad Request")
+                    response.headers.setdefault("Connection", "close")
+                    write_http_response(client_socket, response.to_bytes())
+                    return
+                except OSError:
+                    return
+
                 if not raw_request:
                     return
 
@@ -100,11 +115,29 @@ class HTTPServer:
                     request = HTTPRequest.from_bytes(raw_request)
                 except ValueError:
                     response = HTTPResponse(status_code=400, body="Bad Request")
-                else:
-                    response = self._dispatch(request)
+                    response.headers.setdefault("Connection", "close")
+                    write_http_response(client_socket, response.to_bytes())
+                    return
 
-            logger.info("%s:%s -> %s", address[0], address[1], response.status_code)
-            write_http_response(client_socket, response.to_bytes())
+                request_count += 1
+                response = self._dispatch(request)
+                should_close = (not request.keep_alive) or request_count >= MAX_KEEPALIVE_REQUESTS
+                if should_close:
+                    response.headers.setdefault("Connection", "close")
+                else:
+                    response.headers.setdefault("Connection", "keep-alive")
+                    response.headers.setdefault(
+                        "Keep-Alive",
+                        (
+                            f"timeout={KEEPALIVE_TIMEOUT_SECS}, "
+                            f"max={MAX_KEEPALIVE_REQUESTS - request_count}"
+                        ),
+                    )
+
+                logger.info("%s:%s -> %s", address[0], address[1], response.status_code)
+                write_http_response(client_socket, response.to_bytes())
+                if should_close:
+                    return
 
     def _dispatch(self, request: HTTPRequest) -> HTTPResponse:
         allowed_methods = {"GET", "POST"}
