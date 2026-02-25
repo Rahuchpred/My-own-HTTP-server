@@ -1,4 +1,4 @@
-"""P01 tests for basic TCP listener and one request handling."""
+"""P04 test for the hardcoded GET / home route."""
 
 import socket
 import threading
@@ -7,7 +7,7 @@ import time
 from server import HTTPServer
 
 
-def test_server_accepts_one_connection_and_replies() -> None:
+def test_get_root_returns_home_response() -> None:
     server = HTTPServer(port=0)
     thread = threading.Thread(target=server.start, daemon=True)
     thread.start()
@@ -18,10 +18,10 @@ def test_server_accepts_one_connection_and_replies() -> None:
 
     with socket.create_connection((server.host, server.port), timeout=1.0) as client:
         client.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
-        response = client.recv(1024)
+        raw_response = client.recv(4096)
 
     server.stop()
     thread.join(timeout=1.0)
 
-    assert response.startswith(b"HTTP/1.1 200 OK")
-    assert b"Hello World" in response
+    assert raw_response.startswith(b"HTTP/1.1 200 OK")
+    assert b"Hello World" in raw_response
