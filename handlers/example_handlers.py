@@ -82,5 +82,5 @@ def serve_static(request: HTTPRequest) -> HTTPResponse:
             "ETag": etag,
             "Last-Modified": last_modified,
         },
-        body=static_path.read_bytes(),
+        file_path=static_path,
     )
