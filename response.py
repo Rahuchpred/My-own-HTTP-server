@@ -8,6 +8,7 @@ from config import SERVER_NAME
 
 REASON_PHRASES: dict[int, str] = {
     200: "OK",
+    304: "Not Modified",
     400: "Bad Request",
     403: "Forbidden",
     404: "Not Found",
