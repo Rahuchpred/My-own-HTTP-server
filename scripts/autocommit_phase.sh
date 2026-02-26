@@ -10,6 +10,11 @@ fi
 repo_root="$(git rev-parse --show-toplevel)"
 cd "$repo_root"
 
+# Keep gate commands deterministic: avoid creating local cache artifacts
+# that can be staged as false-positive changes.
+export PYTHONDONTWRITEBYTECODE=1
+export PYTEST_ADDOPTS="${PYTEST_ADDOPTS:-} -p no:cacheprovider"
+
 if command -v python >/dev/null 2>&1; then
   py_bin="python"
 elif command -v python3 >/dev/null 2>&1; then
