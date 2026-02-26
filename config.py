@@ -2,6 +2,7 @@
 
 HOST: str = "127.0.0.1"
 PORT: int = 8080
+HTTPS_PORT: int = 8443
 BUFFER_SIZE: int = 1024
 READ_CHUNK_SIZE: int = 4096
 WRITE_CHUNK_SIZE: int = 16_384
@@ -18,10 +19,16 @@ MAX_KEEPALIVE_REQUESTS: int = 1000
 MAX_ACTIVE_CONNECTIONS: int = 2048
 SELECT_TIMEOUT_SECS: float = 0.1
 IDLE_SWEEP_INTERVAL_SECS: float = 1.0
+SHUTDOWN_POLL_INTERVAL_SECS: float = 0.1
 SERVER_NAME: str = "CustomHTTPServer/2.0"
 SERVER_ENGINE: str = "threadpool"
 ENABLE_CHUNKED_REQUESTS: bool = True
 ENABLE_CHUNKED_RESPONSES: bool = True
 ENABLE_EXPECT_CONTINUE: bool = True
+ENABLE_TLS: bool = False
+TLS_CERT_FILE: str = "certs/dev-cert.pem"
+TLS_KEY_FILE: str = "certs/dev-key.pem"
+REDIRECT_HTTP_TO_HTTPS: bool = True
+DRAIN_TIMEOUT_SECS: float = 5.0
 LOG_FORMAT: str = "plain"
 DEBUG: bool = True
