@@ -33,6 +33,15 @@ class MetricsRegistry:
         self._playground_history_count = 0
         self._playground_replay_total = 0
         self._playground_admin_errors_total = 0
+        self._scenario_runs_total = 0
+        self._scenario_runs_passed = 0
+        self._scenario_runs_failed = 0
+        self._scenario_steps_total = 0
+        self._scenario_assertions_failed_total = 0
+        self._scenario_last_run_duration_ms = 0.0
+        self._incident_state = "inactive"
+        self._incident_profile = "none"
+        self._incident_faults_total = 0
 
     def connection_opened(self) -> None:
         with self._lock:
@@ -120,6 +129,33 @@ class MetricsRegistry:
         with self._lock:
             self._playground_admin_errors_total += 1
 
+    def record_scenario_run(
+        self,
+        *,
+        passed: bool,
+        step_count: int,
+        failed_assertions: int,
+        duration_ms: float,
+    ) -> None:
+        with self._lock:
+            self._scenario_runs_total += 1
+            if passed:
+                self._scenario_runs_passed += 1
+            else:
+                self._scenario_runs_failed += 1
+            self._scenario_steps_total += max(0, step_count)
+            self._scenario_assertions_failed_total += max(0, failed_assertions)
+            self._scenario_last_run_duration_ms = round(max(0.0, duration_ms), 3)
+
+    def set_incident_state(self, *, state: str, profile: str) -> None:
+        with self._lock:
+            self._incident_state = state
+            self._incident_profile = profile
+
+    def record_incident_fault(self) -> None:
+        with self._lock:
+            self._incident_faults_total += 1
+
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             latency_by_route = {
@@ -153,6 +189,15 @@ class MetricsRegistry:
                 "playground_history_count": self._playground_history_count,
                 "playground_replay_total": self._playground_replay_total,
                 "playground_admin_errors_total": self._playground_admin_errors_total,
+                "scenario_runs_total": self._scenario_runs_total,
+                "scenario_runs_passed": self._scenario_runs_passed,
+                "scenario_runs_failed": self._scenario_runs_failed,
+                "scenario_steps_total": self._scenario_steps_total,
+                "scenario_assertions_failed_total": self._scenario_assertions_failed_total,
+                "scenario_last_run_duration_ms": self._scenario_last_run_duration_ms,
+                "incident_state": self._incident_state,
+                "incident_profile": self._incident_profile,
+                "incident_faults_total": self._incident_faults_total,
             }
 
     def _bucket_label(self, duration_ms: float) -> str:

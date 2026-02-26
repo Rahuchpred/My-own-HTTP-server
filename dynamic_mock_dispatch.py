@@ -11,6 +11,11 @@ RESERVED_PREFIXES = (
     "/api/history",
     "/api/replay",
     "/api/playground",
+    "/api/scenarios",
+    "/api/targets",
+    "/api/proxy",
+    "/api/events",
+    "/api/incidents",
 )
 RESERVED_EXACT_PATHS = {
     "/",

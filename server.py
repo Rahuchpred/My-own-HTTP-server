@@ -6,12 +6,15 @@ import argparse
 import json
 import logging
 import os
+import random
 import selectors
 import signal
 import socket
 import ssl
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections import deque
 from collections.abc import Iterator
@@ -20,34 +23,56 @@ from pathlib import Path
 from typing import BinaryIO
 
 from config import (
+    CLI_REFRESH_MS_DEFAULT,
+    DEFAULT_CHAOS_SEED,
+    DEMO_TOKEN,
     DRAIN_TIMEOUT_SECS,
     ENABLE_EXPECT_CONTINUE,
+    ENABLE_INCIDENT_MODE,
+    ENABLE_LIVE_EVENTS,
     ENABLE_PLAYGROUND,
+    ENABLE_SCENARIOS,
+    ENABLE_TARGET_PROXY,
     ENABLE_TLS,
+    EVENT_BUFFER_SIZE,
+    EVENT_HEARTBEAT_SECS,
     HISTORY_LIMIT,
     HOST,
     HTTPS_PORT,
     IDLE_SWEEP_INTERVAL_SECS,
+    INCIDENT_DEFAULT_LATENCY_MS,
+    INCIDENT_DEFAULT_PROBABILITY,
+    INCIDENT_MAX_LATENCY_MS,
     KEEPALIVE_TIMEOUT_SECS,
+    LIVE_EVENTS_REQUIRE_SELECTORS,
     LOG_FORMAT,
     MAX_ACTIVE_CONNECTIONS,
+    MAX_ASSERTIONS_PER_STEP,
     MAX_KEEPALIVE_REQUESTS,
     MAX_MOCK_BODY_BYTES,
     MAX_MOCK_ROUTES,
+    MAX_SCENARIOS,
+    MAX_STEPS_PER_SCENARIO,
+    MAX_TARGETS,
     PORT,
+    PUBLIC_BASE_URL,
     REDIRECT_HTTP_TO_HTTPS,
     REQUEST_QUEUE_SIZE,
+    REQUIRE_DEMO_TOKEN,
+    SCENARIO_STATE_FILE,
     SELECT_TIMEOUT_SECS,
     SERVER_ENGINE,
     SHUTDOWN_POLL_INTERVAL_SECS,
     SOCKET_TIMEOUT_SECS,
     STATE_FILE,
+    TARGET_STATE_FILE,
     TLS_CERT_FILE,
     TLS_KEY_FILE,
     WORKER_COUNT,
     WRITE_CHUNK_SIZE,
 )
 from dynamic_mock_dispatch import response_from_mock
+from event_hub import EventHub
 from handlers.example_handlers import home, serve_static, stream_demo, submit
 from metrics import MetricsRegistry
 from playground_api import PlaygroundAPI
@@ -55,6 +80,9 @@ from playground_store import PlaygroundStore
 from request import KNOWN_METHODS, HTTPRequest, HTTPRequestParseError
 from response import REASON_PHRASES, HTTPResponse, iter_chunked_encoded, prepare_response
 from router import Router
+from scenario_api import ScenarioAPI
+from scenario_engine import ScenarioEngine
+from scenario_store import ScenarioStore
 from socket_handler import (
     HeaderTooLargeError,
     MalformedRequestError,
@@ -66,6 +94,8 @@ from socket_handler import (
     write_http_response,
     write_http_response_message,
 )
+from target_store import TargetStore
+from target_store import utc_now as target_utc_now
 from thread_pool import ThreadPool
 
 logger = logging.getLogger(__name__)
@@ -170,6 +200,17 @@ class TLSConfig:
     redirect_http_to_https: bool
 
 
+@dataclass(slots=True)
+class IncidentProfile:
+    active: bool = False
+    mode: str = "none"
+    probability: float = INCIDENT_DEFAULT_PROBABILITY
+    latency_ms: int = INCIDENT_DEFAULT_LATENCY_MS
+    seed: int = 1337
+    started_at: float = 0.0
+    affected_requests: int = 0
+
+
 class HTTPServer:
     def __init__(
         self,
@@ -194,6 +235,23 @@ class HTTPServer:
         history_limit: int = HISTORY_LIMIT,
         max_mock_body_bytes: int = MAX_MOCK_BODY_BYTES,
         max_mock_routes: int = MAX_MOCK_ROUTES,
+        enable_scenarios: bool = ENABLE_SCENARIOS,
+        scenario_state_file: str = SCENARIO_STATE_FILE,
+        max_scenarios: int = MAX_SCENARIOS,
+        max_steps_per_scenario: int = MAX_STEPS_PER_SCENARIO,
+        max_assertions_per_step: int = MAX_ASSERTIONS_PER_STEP,
+        default_chaos_seed: int = DEFAULT_CHAOS_SEED,
+        enable_live_events: bool = ENABLE_LIVE_EVENTS,
+        event_buffer_size: int = EVENT_BUFFER_SIZE,
+        event_heartbeat_secs: int = EVENT_HEARTBEAT_SECS,
+        live_events_require_selectors: bool = LIVE_EVENTS_REQUIRE_SELECTORS,
+        cli_refresh_ms_default: int = CLI_REFRESH_MS_DEFAULT,
+        enable_target_proxy: bool = ENABLE_TARGET_PROXY,
+        target_state_file: str = TARGET_STATE_FILE,
+        max_targets: int = MAX_TARGETS,
+        demo_token: str = DEMO_TOKEN,
+        require_demo_token: bool = REQUIRE_DEMO_TOKEN,
+        public_base_url: str = PUBLIC_BASE_URL,
     ) -> None:
         self.host = host
         self.port = port
@@ -212,6 +270,23 @@ class HTTPServer:
         self.history_limit = history_limit
         self.max_mock_body_bytes = max_mock_body_bytes
         self.max_mock_routes = max_mock_routes
+        self.enable_scenarios = enable_scenarios
+        self.scenario_state_file = scenario_state_file
+        self.max_scenarios = max_scenarios
+        self.max_steps_per_scenario = max_steps_per_scenario
+        self.max_assertions_per_step = max_assertions_per_step
+        self.default_chaos_seed = default_chaos_seed
+        self.enable_live_events = enable_live_events
+        self.event_heartbeat_secs = event_heartbeat_secs
+        self.live_events_require_selectors = live_events_require_selectors
+        self.cli_refresh_ms_default = cli_refresh_ms_default
+        self.enable_target_proxy = enable_target_proxy
+        self.target_state_file = target_state_file
+        self.max_targets = max_targets
+        self.demo_token = demo_token
+        self.require_demo_token = require_demo_token
+        self.public_base_url = public_base_url
+        self.enable_incident_mode = ENABLE_INCIDENT_MODE
 
         self.tls_config = TLSConfig(
             enabled=enable_tls,
@@ -234,9 +309,20 @@ class HTTPServer:
         self._drain_started_at = 0.0
         self._drain_elapsed_ms = 0.0
         self._state_lock = threading.Lock()
+        self._incident_lock = threading.Lock()
+        self._incident_profile = IncidentProfile()
+        self._incident_request_seq = 0
         self.metrics = MetricsRegistry()
+        self.metrics.set_incident_state(state="inactive", profile="none")
+        self.event_hub: EventHub | None = (
+            EventHub(buffer_size=event_buffer_size) if self.enable_live_events else None
+        )
         self.playground_store: PlaygroundStore | None = None
         self.playground_api: PlaygroundAPI | None = None
+        self.scenario_store: ScenarioStore | None = None
+        self.scenario_engine: ScenarioEngine | None = None
+        self.scenario_api: ScenarioAPI | None = None
+        self.target_store: TargetStore | None = None
         if self.enable_playground:
             self.playground_store = PlaygroundStore(
                 state_file=self.state_file,
@@ -253,6 +339,36 @@ class HTTPServer:
                 mock_count=len(snapshot.get("mocks", [])),
                 history_count=len(snapshot.get("history", [])),
             )
+        if self.enable_scenarios:
+            self.scenario_store = ScenarioStore(
+                state_file=self.scenario_state_file,
+                max_scenarios=self.max_scenarios,
+            )
+            self.scenario_engine = ScenarioEngine(
+                dispatch_request=self._dispatch_internal_request,
+                max_steps_per_scenario=self.max_steps_per_scenario,
+                max_assertions_per_step=self.max_assertions_per_step,
+                default_seed=self.default_chaos_seed,
+            )
+            self.scenario_api = ScenarioAPI(
+                store=self.scenario_store,
+                engine=self.scenario_engine,
+                emit_event=self._emit_event,
+            )
+        if self.enable_target_proxy:
+            self.target_store = TargetStore(
+                state_file=self.target_state_file,
+                max_targets=self.max_targets,
+            )
+        self._emit_event(
+            "system.health",
+            "",
+            {
+                "state": "server_initialized",
+                "engine": self.engine,
+                "live_events": self.enable_live_events,
+            },
+        )
 
     def _build_default_router(self) -> Router:
         router = Router()
@@ -630,6 +746,464 @@ class HTTPServer:
     def _new_trace_id(self) -> str:
         return uuid.uuid4().hex[:16]
 
+    def _emit_event(self, event_type: str, trace_id: str, payload: dict[str, object]) -> None:
+        if self.event_hub is None:
+            return
+        self.event_hub.publish(
+            event_type=event_type,
+            source="server",
+            trace_id=trace_id,
+            payload=payload,
+        )
+
+    def _is_protected_path(self, path: str) -> bool:
+        protected_prefixes = (
+            "/api/mocks",
+            "/api/history",
+            "/api/replay",
+            "/api/scenarios",
+            "/api/targets",
+            "/api/proxy/request",
+            "/api/events",
+            "/api/incidents",
+        )
+        return any(path.startswith(prefix) for prefix in protected_prefixes)
+
+    def _is_authorized(self, request: HTTPRequest) -> bool:
+        auth_enabled = self.require_demo_token or bool(self.demo_token)
+        if not auth_enabled:
+            return True
+
+        expected = self.demo_token
+        if not expected:
+            return False
+
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.startswith("Bearer "):
+            presented = auth_header.removeprefix("Bearer ").strip()
+            if presented == expected:
+                return True
+
+        query_token = request.query_params.get("token", [])
+        if query_token and query_token[0] == expected:
+            return True
+
+        return False
+
+    def _unauthorized_response(self) -> HTTPResponse:
+        return HTTPResponse(
+            status_code=401,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"error": {"code": "unauthorized", "message": "unauthorized"}}),
+        )
+
+    def _incident_state_payload(self) -> dict[str, object]:
+        with self._incident_lock:
+            return {
+                "active": self._incident_profile.active,
+                "mode": self._incident_profile.mode,
+                "probability": self._incident_profile.probability,
+                "latency_ms": self._incident_profile.latency_ms,
+                "seed": self._incident_profile.seed,
+                "started_at": (
+                    0.0
+                    if self._incident_profile.started_at <= 0
+                    else self._incident_profile.started_at
+                ),
+                "affected_requests": self._incident_profile.affected_requests,
+            }
+
+    def _set_incident_profile(
+        self,
+        *,
+        mode: str,
+        probability: float,
+        latency_ms: int,
+        seed: int,
+    ) -> dict[str, object]:
+        with self._incident_lock:
+            self._incident_profile.active = True
+            self._incident_profile.mode = mode
+            self._incident_profile.probability = probability
+            self._incident_profile.latency_ms = latency_ms
+            self._incident_profile.seed = seed
+            self._incident_profile.started_at = time.time()
+            self._incident_profile.affected_requests = 0
+        self.metrics.set_incident_state(state="active", profile=mode)
+        payload = self._incident_state_payload()
+        self._emit_event("incident.started", "", payload)
+        return payload
+
+    def _stop_incident_profile(self) -> dict[str, object]:
+        with self._incident_lock:
+            self._incident_profile = IncidentProfile()
+        self.metrics.set_incident_state(state="inactive", profile="none")
+        payload = self._incident_state_payload()
+        self._emit_event("incident.stopped", "", payload)
+        return payload
+
+    def _handle_incident_request(self, request: HTTPRequest) -> HTTPResponse:
+        if not self.enable_incident_mode:
+            return HTTPResponse(
+                status_code=404,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {"error": {"code": "disabled", "message": "incident mode is disabled"}}
+                ),
+            )
+        if request.path == "/api/incidents/state":
+            if request.method not in {"GET", "HEAD"}:
+                return HTTPResponse(
+                    status_code=405,
+                    headers={"Allow": "GET, HEAD"},
+                    body="Method Not Allowed",
+                )
+            return HTTPResponse(
+                status_code=200,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps({"incident": self._incident_state_payload()}, sort_keys=True),
+            )
+        if request.path == "/api/incidents/stop":
+            if request.method != "POST":
+                return HTTPResponse(
+                    status_code=405,
+                    headers={"Allow": "POST"},
+                    body="Method Not Allowed",
+                )
+            return HTTPResponse(
+                status_code=200,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {"incident": self._stop_incident_profile(), "status": "stopped"},
+                    sort_keys=True,
+                ),
+            )
+        if request.path != "/api/incidents/start":
+            return HTTPResponse(status_code=404, body="Not Found")
+        if request.method != "POST":
+            return HTTPResponse(
+                status_code=405,
+                headers={"Allow": "POST"},
+                body="Method Not Allowed",
+            )
+        payload, error = self._read_json_payload(request)
+        if error is not None:
+            return error
+        mode = str(payload.get("mode", "status_spike_503")).strip().lower()
+        valid_modes = {"status_spike_503", "fixed_latency", "body_drop"}
+        if mode not in valid_modes:
+            return self._targets_response(
+                400,
+                {
+                    "error": {
+                        "code": "invalid_incident",
+                        "message": "mode must be status_spike_503, fixed_latency, or body_drop",
+                    }
+                },
+            )
+        probability = float(payload.get("probability", INCIDENT_DEFAULT_PROBABILITY))
+        probability = max(0.0, min(1.0, probability))
+        latency_ms = int(payload.get("latency_ms", INCIDENT_DEFAULT_LATENCY_MS))
+        latency_ms = max(0, min(INCIDENT_MAX_LATENCY_MS, latency_ms))
+        seed = int(payload.get("seed", 1337))
+        state = self._set_incident_profile(
+            mode=mode,
+            probability=probability,
+            latency_ms=latency_ms,
+            seed=seed,
+        )
+        return HTTPResponse(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"incident": state, "status": "started"}, sort_keys=True),
+        )
+
+    def _incident_should_skip_path(self, path: str) -> bool:
+        return (
+            path.startswith("/api/")
+            or path.startswith("/static/")
+            or path == "/_metrics"
+            or path == "/playground"
+        )
+
+    def _incident_decision(self, profile: IncidentProfile) -> bool:
+        with self._incident_lock:
+            self._incident_request_seq += 1
+            seq = self._incident_request_seq
+        value = random.Random(profile.seed + seq).random()
+        return value <= profile.probability
+
+    def _apply_incident_profile(self, request: HTTPRequest, response: HTTPResponse) -> HTTPResponse:
+        if not self.enable_incident_mode:
+            return response
+        if self._incident_should_skip_path(request.path):
+            return response
+
+        with self._incident_lock:
+            profile = IncidentProfile(
+                active=self._incident_profile.active,
+                mode=self._incident_profile.mode,
+                probability=self._incident_profile.probability,
+                latency_ms=self._incident_profile.latency_ms,
+                seed=self._incident_profile.seed,
+                started_at=self._incident_profile.started_at,
+                affected_requests=self._incident_profile.affected_requests,
+            )
+
+        if not profile.active:
+            return response
+
+        applied = False
+        mode = profile.mode
+
+        if mode == "fixed_latency" and profile.latency_ms > 0:
+            time.sleep(profile.latency_ms / 1000)
+            applied = True
+
+        if mode == "status_spike_503" and self._incident_decision(profile):
+            response = HTTPResponse(
+                status_code=503,
+                headers={"Content-Type": "text/plain; charset=utf-8"},
+                body="Incident Injected: upstream unavailable",
+            )
+            applied = True
+
+        if mode == "body_drop" and self._incident_decision(profile):
+            response = HTTPResponse(
+                status_code=response.status_code,
+                reason_phrase=response.reason_phrase,
+                headers=dict(response.headers),
+                body=b"",
+            )
+            applied = True
+
+        if not applied:
+            return response
+
+        with self._incident_lock:
+            self._incident_profile.affected_requests += 1
+            affected = self._incident_profile.affected_requests
+            current_mode = self._incident_profile.mode
+        self.metrics.record_incident_fault()
+        self._emit_event(
+            "incident.affected",
+            str(response.headers.get("X-Request-ID", "")),
+            {
+                "mode": current_mode,
+                "path": request.path,
+                "method": request.method,
+                "status": response.status_code,
+                "affected_requests": affected,
+            },
+        )
+        return response
+
+    def _event_topics(self, request: HTTPRequest) -> set[str] | None:
+        raw_topics = request.query_params.get("topics", [])
+        if not raw_topics:
+            return None
+        tokens = [item.strip() for item in raw_topics[0].split(",") if item.strip()]
+        if not tokens:
+            return None
+        return set(tokens)
+
+    def _event_since_id(self, request: HTTPRequest) -> int:
+        since_values = request.query_params.get("since_id", [])
+        if not since_values:
+            last_event_values = request.headers.get("last-event-id", "")
+            if not last_event_values:
+                return 0
+            try:
+                return int(last_event_values)
+            except ValueError:
+                return 0
+        try:
+            return max(0, int(since_values[0]))
+        except ValueError:
+            return 0
+
+    def _event_limit(self, request: HTTPRequest, default: int = 200) -> int:
+        values = request.query_params.get("limit", [])
+        if not values:
+            return default
+        try:
+            return max(1, min(1000, int(values[0])))
+        except ValueError:
+            return default
+
+    def _events_snapshot_response(self, request: HTTPRequest) -> HTTPResponse:
+        if self.event_hub is None:
+            return HTTPResponse(
+                status_code=404,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps({"error": {"code": "disabled", "message": "live events disabled"}}),
+            )
+        snapshot = self.event_hub.snapshot(
+            since_id=self._event_since_id(request),
+            limit=self._event_limit(request, default=200),
+            topics=self._event_topics(request),
+        )
+        snapshot["refresh_ms"] = self.cli_refresh_ms_default
+        return HTTPResponse(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(snapshot, sort_keys=True),
+        )
+
+    def _events_stream_response(self, request: HTTPRequest) -> HTTPResponse:
+        if self.event_hub is None:
+            return HTTPResponse(status_code=404, body="Not Found")
+        if self.live_events_require_selectors and self.engine != "selectors":
+            return HTTPResponse(
+                status_code=409,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {
+                        "error": {
+                            "code": "use_selectors_engine",
+                            "message": "live events require selectors engine",
+                        }
+                    }
+                ),
+            )
+
+        snapshot = self.event_hub.snapshot(
+            since_id=self._event_since_id(request),
+            limit=self._event_limit(request, default=200),
+            topics=self._event_topics(request),
+        )
+        lines = [f"retry: {max(100, self.cli_refresh_ms_default)}\n\n"]
+        if snapshot.get("overflowed", False):
+            lines.append("event: stream.gap\n")
+            lines.append(
+                "data: "
+                + json.dumps(
+                    {
+                        "overflowed": True,
+                        "oldest_id": snapshot.get("oldest_id", 0),
+                        "latest_id": snapshot.get("latest_id", 0),
+                    },
+                    sort_keys=True,
+                )
+                + "\n\n"
+            )
+        for event in snapshot["events"]:
+            lines.append(f"id: {event['id']}\n")
+            lines.append(f"event: {event['type']}\n")
+            lines.append(f"data: {json.dumps(event, sort_keys=True)}\n\n")
+        if not snapshot["events"]:
+            lines.append(": heartbeat\n\n")
+
+        return HTTPResponse(
+            status_code=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "close",
+                "X-Events-Latest-ID": str(snapshot["latest_id"]),
+                "X-Event-Heartbeat-Secs": str(max(1, int(self.event_heartbeat_secs))),
+            },
+            body="".join(lines),
+        )
+
+    def _validate_target_payload(
+        self,
+        payload: dict[str, object],
+        *,
+        target_id: str | None = None,
+    ) -> tuple[bool, str]:
+        if target_id is None:
+            target_id = str(payload.get("id", "") or uuid.uuid4().hex[:8])
+        name = str(payload.get("name", "")).strip()
+        base_url = str(payload.get("base_url", "")).strip()
+        if not name:
+            return False, "name is required"
+        if not (base_url.startswith("http://") or base_url.startswith("https://")):
+            return False, "base_url must start with http:// or https://"
+        return True, ""
+
+    def _target_headers(self, request: HTTPRequest) -> dict[str, str]:
+        headers_raw = request.headers.get("content-type", "")
+        _ = headers_raw
+        return {"Content-Type": "application/json"}
+
+    def _proxy_request_to_target(
+        self,
+        *,
+        target: dict[str, object],
+        method: str,
+        path: str,
+        headers: dict[str, str],
+        body: str,
+        timeout_ms: int,
+    ) -> tuple[int, dict[str, str], str]:
+        target_url = str(target["base_url"]).rstrip("/")
+        full_url = f"{target_url}{path}"
+        data = body.encode("utf-8") if body else None
+        req = urllib.request.Request(
+            url=full_url,
+            method=method,
+            headers={str(k): str(v) for k, v in headers.items()},
+            data=data,
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=max(1, timeout_ms) / 1000) as resp:
+                response_body = resp.read().decode("utf-8", errors="replace")
+                response_headers = {str(k): str(v) for k, v in resp.headers.items()}
+                return int(resp.status), response_headers, response_body
+        except urllib.error.HTTPError as exc:
+            response_body = exc.read().decode("utf-8", errors="replace")
+            response_headers = {str(k): str(v) for k, v in exc.headers.items()}
+            return int(exc.code), response_headers, response_body
+        except urllib.error.URLError as exc:
+            return 504, {"Content-Type": "application/json"}, json.dumps(
+                {"error": {"code": "proxy_timeout", "message": str(exc)}}
+            )
+
+    def _dispatch_to_target(self, request: HTTPRequest, *, target_id: str) -> HTTPResponse:
+        if self.target_store is None:
+            return HTTPResponse(status_code=404, body="Target store disabled")
+        target = self.target_store.get_target(target_id)
+        if target is None:
+            return HTTPResponse(
+                status_code=404,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {
+                        "error": {
+                            "code": "target_not_found",
+                            "message": "target not found",
+                        }
+                    }
+                ),
+            )
+        status, response_headers, response_body = self._proxy_request_to_target(
+            target=target,
+            method=request.method,
+            path=request.raw_target,
+            headers=dict(request.headers),
+            body=request.body.decode("utf-8", errors="replace"),
+            timeout_ms=int(target.get("timeout_ms", 5000)),
+        )
+        trace_id = self._new_trace_id()
+        self._emit_event(
+            "proxy.request.completed",
+            trace_id,
+            {
+                "target_id": target_id,
+                "method": request.method,
+                "path": request.raw_target,
+                "status": status,
+            },
+        )
+        proxy_response = HTTPResponse(
+            status_code=status,
+            headers=response_headers,
+            body=response_body,
+        )
+        proxy_response.headers.setdefault("X-Request-ID", trace_id)
+        return proxy_response
+
     def _build_replay_input(self, request: HTTPRequest) -> dict[str, object]:
         return {
             "method": request.method,
@@ -829,6 +1403,7 @@ class HTTPServer:
                         return
                     self.metrics.request_started(connection_reused=connection_reused)
                     response = self._dispatch(request)
+                    response = self._apply_incident_profile(request, response)
                     response.headers.setdefault("X-Request-ID", trace_id)
                     should_close = (
                         (not request.keep_alive)
@@ -1078,6 +1653,7 @@ class HTTPServer:
             self.metrics.request_started(connection_reused=connection_reused)
 
             response = self._dispatch(request)
+            response = self._apply_incident_profile(request, response)
             response.headers.setdefault("X-Request-ID", trace_id)
             should_close = (
                 (not request.keep_alive)
@@ -1399,8 +1975,20 @@ class HTTPServer:
         self._selector_connections.pop(fileno, None)
         self.metrics.connection_closed()
 
-    def _dispatch_internal_request(self, request: HTTPRequest) -> HTTPResponse:
+    def _dispatch_internal_request(
+        self,
+        request: HTTPRequest,
+        *,
+        target_id: str = "local",
+    ) -> HTTPResponse:
+        if target_id != "local":
+            response = self._dispatch_to_target(request, target_id=target_id)
+            response = self._apply_incident_profile(request, response)
+            if response.headers.get("X-Request-ID") is None:
+                response.headers["X-Request-ID"] = self._new_trace_id()
+            return response
         response = self._dispatch(request)
+        response = self._apply_incident_profile(request, response)
         if response.headers.get("X-Request-ID") is None:
             response.headers["X-Request-ID"] = self._new_trace_id()
         return response
@@ -1418,7 +2006,245 @@ class HTTPServer:
             return self._as_head_response(response)
         return response
 
-    def _is_playground_admin_path(self, path: str) -> bool:
+    def _read_json_payload(
+        self,
+        request: HTTPRequest,
+    ) -> tuple[dict[str, object], HTTPResponse | None]:
+        try:
+            decoded = request.body.decode("utf-8") if request.body else "{}"
+            payload = json.loads(decoded)
+        except UnicodeDecodeError:
+            return {}, HTTPResponse(
+                status_code=400,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {
+                        "error": {
+                            "code": "invalid_json",
+                            "message": "body must be utf-8",
+                        }
+                    }
+                ),
+            )
+        except json.JSONDecodeError:
+            return {}, HTTPResponse(
+                status_code=400,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {"error": {"code": "invalid_json", "message": "body must be valid json"}}
+                ),
+            )
+
+        if not isinstance(payload, dict):
+            return {}, HTTPResponse(
+                status_code=400,
+                headers={"Content-Type": "application/json"},
+                body=json.dumps(
+                    {"error": {"code": "invalid_json", "message": "top-level must be object"}}
+                ),
+            )
+        return payload, None
+
+    def _targets_response(self, status_code: int, payload: dict[str, object]) -> HTTPResponse:
+        return HTTPResponse(
+            status_code=status_code,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(payload, sort_keys=True),
+        )
+
+    def _handle_targets_request(self, request: HTTPRequest) -> HTTPResponse:
+        if not self.enable_target_proxy or self.target_store is None:
+            return HTTPResponse(status_code=404, body="Not Found")
+
+        if request.path == "/api/targets":
+            if request.method == "GET":
+                return self._targets_response(200, {"targets": self.target_store.list_targets()})
+            if request.method != "POST":
+                return HTTPResponse(
+                    status_code=405,
+                    headers={"Allow": "GET, POST"},
+                    body="Method Not Allowed",
+                )
+
+            payload, error = self._read_json_payload(request)
+            if error is not None:
+                return error
+            target_id = str(payload.get("id") or uuid.uuid4().hex[:8])
+            ok, message = self._validate_target_payload(payload, target_id=target_id)
+            if not ok:
+                return self._targets_response(
+                    400,
+                    {"error": {"code": "invalid_target", "message": message}},
+                )
+            target = {
+                "id": target_id,
+                "name": str(payload.get("name", "")),
+                "base_url": str(payload.get("base_url", "")),
+                "enabled": bool(payload.get("enabled", True)),
+                "timeout_ms": int(payload.get("timeout_ms", 5000)),
+                "created_at": target_utc_now(),
+                "updated_at": target_utc_now(),
+            }
+            try:
+                created = self.target_store.create_target(target)
+            except ValueError as exc:
+                reason = str(exc)
+                if reason == "max_targets_exceeded":
+                    return self._targets_response(
+                        413,
+                        {"error": {"code": "target_limit", "message": "max targets reached"}},
+                    )
+                return self._targets_response(
+                    409,
+                    {"error": {"code": "duplicate_target", "message": "target already exists"}},
+                )
+            return self._targets_response(201, {"target": created})
+
+        target_id = request.path.removeprefix("/api/targets/")
+        if not target_id:
+            return self._targets_response(
+                404,
+                {"error": {"code": "not_found", "message": "not found"}},
+            )
+
+        if request.method == "DELETE":
+            deleted = self.target_store.delete_target(target_id)
+            if not deleted:
+                return self._targets_response(
+                    404,
+                    {"error": {"code": "not_found", "message": "target not found"}},
+                )
+            return self._targets_response(200, {"deleted": True, "id": target_id})
+
+        if request.method != "PUT":
+            return HTTPResponse(
+                status_code=405,
+                headers={"Allow": "PUT, DELETE"},
+                body="Method Not Allowed",
+            )
+
+        existing = self.target_store.get_target(target_id)
+        if existing is None:
+            return self._targets_response(
+                404,
+                {"error": {"code": "not_found", "message": "target not found"}},
+            )
+        payload, error = self._read_json_payload(request)
+        if error is not None:
+            return error
+        merged = dict(existing)
+        merged.update(payload)
+        ok, message = self._validate_target_payload(merged, target_id=target_id)
+        if not ok:
+            return self._targets_response(
+                400,
+                {"error": {"code": "invalid_target", "message": message}},
+            )
+        merged["id"] = target_id
+        merged["updated_at"] = target_utc_now()
+        try:
+            updated = self.target_store.update_target(target_id, merged)
+        except ValueError:
+            return self._targets_response(
+                409,
+                {"error": {"code": "duplicate_target", "message": "target already exists"}},
+            )
+        if updated is None:
+            return self._targets_response(
+                404,
+                {"error": {"code": "not_found", "message": "target not found"}},
+            )
+        return self._targets_response(200, {"target": updated})
+
+    def _handle_proxy_request(self, request: HTTPRequest) -> HTTPResponse:
+        if not self.enable_target_proxy or self.target_store is None:
+            return HTTPResponse(status_code=404, body="Not Found")
+        if request.method != "POST":
+            return HTTPResponse(
+                status_code=405,
+                headers={"Allow": "POST"},
+                body="Method Not Allowed",
+            )
+
+        payload, error = self._read_json_payload(request)
+        if error is not None:
+            return error
+
+        target_id = str(payload.get("target_id", "")).strip()
+        method = str(payload.get("method", "GET")).upper()
+        path = str(payload.get("path", "/")).strip()
+        if not target_id:
+            return self._targets_response(
+                400,
+                {"error": {"code": "invalid_proxy_request", "message": "target_id is required"}},
+            )
+        if method not in {"GET", "POST", "PUT", "DELETE"}:
+            return self._targets_response(
+                400,
+                {"error": {"code": "invalid_proxy_request", "message": "invalid method"}},
+            )
+        if not path.startswith("/"):
+            return self._targets_response(
+                400,
+                {"error": {"code": "invalid_proxy_request", "message": "path must start with /"}},
+            )
+
+        headers_raw = payload.get("headers", {})
+        if headers_raw is None:
+            headers_raw = {}
+        if not isinstance(headers_raw, dict):
+            return self._targets_response(
+                400,
+                {"error": {"code": "invalid_proxy_request", "message": "headers must be object"}},
+            )
+
+        timeout_ms = int(payload.get("timeout_ms", 5000))
+        body_text = str(payload.get("body", ""))
+
+        target = self.target_store.get_target(target_id)
+        if target is None:
+            return self._targets_response(
+                404,
+                {"error": {"code": "target_not_found", "message": "target not found"}},
+            )
+
+        status, response_headers, response_body = self._proxy_request_to_target(
+            target=target,
+            method=method,
+            path=path,
+            headers={str(k): str(v) for k, v in headers_raw.items()},
+            body=body_text,
+            timeout_ms=timeout_ms,
+        )
+        trace_id = self._new_trace_id()
+        self._emit_event(
+            "proxy.request.completed",
+            trace_id,
+            {
+                "target_id": target_id,
+                "method": method,
+                "path": path,
+                "status": status,
+            },
+        )
+        return self._targets_response(
+            200,
+            {
+                "request": {
+                    "target_id": target_id,
+                    "method": method,
+                    "path": path,
+                },
+                "response": {
+                    "status": status,
+                    "headers": response_headers,
+                    "body": response_body,
+                },
+                "trace_id": trace_id,
+            },
+        )
+
+    def _is_api_admin_path(self, path: str) -> bool:
         return (
             path == "/api/playground/state"
             or path == "/api/mocks"
@@ -1426,11 +2252,16 @@ class HTTPServer:
             or path == "/api/playground/request"
             or path.startswith("/api/mocks/")
             or path.startswith("/api/replay/")
+            or path == "/api/scenarios"
+            or path.startswith("/api/scenarios/")
+            or path.startswith("/api/incidents/")
         )
 
     def _dispatch(self, request: HTTPRequest) -> HTTPResponse:
         if request.method not in KNOWN_METHODS:
             return HTTPResponse(status_code=501, body="Not Implemented")
+        if self._is_protected_path(request.path) and not self._is_authorized(request):
+            return self._unauthorized_response()
 
         if request.path == "/_metrics":
             if request.method not in {"GET", "HEAD"}:
@@ -1450,6 +2281,43 @@ class HTTPServer:
             if request.method == "HEAD":
                 return self._as_head_response(metrics_response)
             return metrics_response
+        if request.path == "/api/events/snapshot":
+            if request.method not in {"GET", "HEAD"}:
+                return HTTPResponse(
+                    status_code=405,
+                    headers={"Allow": "GET, HEAD"},
+                    body="Method Not Allowed",
+                )
+            snapshot_response = self._events_snapshot_response(request)
+            if request.method == "HEAD":
+                return self._as_head_response(snapshot_response)
+            return snapshot_response
+        if request.path == "/api/events/stream":
+            if request.method not in {"GET", "HEAD"}:
+                return HTTPResponse(
+                    status_code=405,
+                    headers={"Allow": "GET, HEAD"},
+                    body="Method Not Allowed",
+                )
+            stream_response = self._events_stream_response(request)
+            if request.method == "HEAD":
+                return self._as_head_response(stream_response)
+            return stream_response
+        if request.path == "/api/targets" or request.path.startswith("/api/targets/"):
+            response = self._handle_targets_request(request)
+            if request.method == "HEAD":
+                return self._as_head_response(response)
+            return response
+        if request.path == "/api/proxy/request":
+            response = self._handle_proxy_request(request)
+            if request.method == "HEAD":
+                return self._as_head_response(response)
+            return response
+        if request.path.startswith("/api/incidents/"):
+            response = self._handle_incident_request(request)
+            if request.method == "HEAD":
+                return self._as_head_response(response)
+            return response
 
         if request.path == "/playground":
             if not self.enable_playground:
@@ -1462,7 +2330,52 @@ class HTTPServer:
                 )
             return self._serve_playground_page(as_head=request.method == "HEAD")
 
-        if self._is_playground_admin_path(request.path):
+        if self._is_api_admin_path(request.path):
+            if request.path == "/api/scenarios" or request.path.startswith("/api/scenarios/"):
+                if not self.enable_scenarios or self.scenario_api is None:
+                    return HTTPResponse(status_code=404, body="Not Found")
+                response, run = self.scenario_api.handle(request)
+                if response.status_code >= 400:
+                    self.metrics.record_playground_admin_error()
+                if run is not None:
+                    failed_assertions = int(run.get("failed_assertions", 0))
+                    summary = run.get("summary", {})
+                    self.metrics.record_scenario_run(
+                        passed=str(run.get("status", "fail")) == "pass",
+                        step_count=int(summary.get("passed", 0)) + int(summary.get("failed", 0)),
+                        failed_assertions=failed_assertions,
+                        duration_ms=float(summary.get("duration_ms", 0.0)),
+                    )
+                    for step in run.get("step_results", []):
+                        scenario_event = {
+                            "scenario_id": str(run.get("scenario_id", "")),
+                            "run_id": str(run.get("run_id", "")),
+                            "step_id": str(step.get("step_id", "")),
+                            "assertion_fail_count": sum(
+                                1
+                                for assertion in step.get("assertions", [])
+                                if not assertion.get("passed", False)
+                            ),
+                            "chaos_applied": bool(step.get("chaos_applied", False)),
+                            "scenario_seed": str(run.get("seed", "")),
+                        }
+                        if self.log_format == "json":
+                            logger.info(json.dumps(scenario_event, sort_keys=True))
+                        else:
+                            logger.info(
+                                "scenario_id=%s run_id=%s step_id=%s "
+                                "assertion_fail_count=%s chaos_applied=%s scenario_seed=%s",
+                                scenario_event["scenario_id"],
+                                scenario_event["run_id"],
+                                scenario_event["step_id"],
+                                scenario_event["assertion_fail_count"],
+                                scenario_event["chaos_applied"],
+                                scenario_event["scenario_seed"],
+                            )
+                if request.method == "HEAD":
+                    return self._as_head_response(response)
+                return response
+
             if not self.enable_playground or self.playground_api is None:
                 return HTTPResponse(status_code=404, body="Not Found")
             response = self.playground_api.handle(request)
@@ -1596,6 +2509,10 @@ class HTTPServer:
         elif path.startswith("/api/replay/") and method == "POST":
             event["playground_action"] = "replay"
             event["replayed_request_id"] = path.removeprefix("/api/replay/")
+        elif path.startswith("/api/scenarios/") and path.endswith("/run") and method == "POST":
+            event["scenario_id"] = path.removeprefix("/api/scenarios/").removesuffix("/run")
+            event["run_id"] = response.headers.get("X-Scenario-Run-ID", "")
+            event["scenario_seed"] = response.headers.get("X-Scenario-Seed", "")
 
         should_capture_history = (
             path not in {"/_metrics", "/api/playground/state"}
@@ -1628,30 +2545,45 @@ class HTTPServer:
 
         if self.log_format == "json":
             logger.info(json.dumps(event, sort_keys=True))
-            return
+        else:
+            logger.info(
+                (
+                    "client=%s method=%s path=%s status=%s engine=%s "
+                    "connection_id=%s request_id=%s bytes_in=%s bytes_out=%s "
+                    "duration_ms=%.2f connection_reused=%s route_key=%s "
+                    "trace_id=%s shutdown_phase=%s drain_elapsed_ms=%.2f"
+                ),
+                event["client"],
+                event["method"],
+                event["path"],
+                event["status"],
+                event["engine"],
+                event["connection_id"],
+                event["request_id"],
+                event["bytes_in"],
+                event["bytes_out"],
+                duration_ms,
+                event["connection_reused"],
+                event["route_key"],
+                event["trace_id"],
+                event["shutdown_phase"],
+                event["drain_elapsed_ms"],
+            )
 
-        logger.info(
-            (
-                "client=%s method=%s path=%s status=%s engine=%s "
-                "connection_id=%s request_id=%s bytes_in=%s bytes_out=%s "
-                "duration_ms=%.2f connection_reused=%s route_key=%s "
-                "trace_id=%s shutdown_phase=%s drain_elapsed_ms=%.2f"
-            ),
-            event["client"],
-            event["method"],
-            event["path"],
-            event["status"],
-            event["engine"],
-            event["connection_id"],
-            event["request_id"],
-            event["bytes_in"],
-            event["bytes_out"],
-            duration_ms,
-            event["connection_reused"],
-            event["route_key"],
-            event["trace_id"],
-            event["shutdown_phase"],
-            event["drain_elapsed_ms"],
+        self._emit_event(
+            "request.completed",
+            str(event["trace_id"]),
+            {
+                "method": method,
+                "path": path,
+                "status": response.status_code,
+                "bytes_in": bytes_in,
+                "bytes_out": payload_size,
+                "latency_ms": round(duration_ms, 3),
+                "route_key": event["route_key"],
+                "connection_reused": connection_reused,
+                "engine": self.engine,
+            },
         )
 
     def _request_with_method(self, request: HTTPRequest, method: str) -> HTTPRequest:
@@ -1726,6 +2658,47 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--state-file", default=STATE_FILE)
     parser.add_argument("--history-limit", type=int, default=HISTORY_LIMIT)
     parser.add_argument("--max-mock-body-bytes", type=int, default=MAX_MOCK_BODY_BYTES)
+    parser.add_argument(
+        "--enable-scenarios",
+        action=argparse.BooleanOptionalAction,
+        default=ENABLE_SCENARIOS,
+    )
+    parser.add_argument("--scenario-state-file", default=SCENARIO_STATE_FILE)
+    parser.add_argument("--max-scenarios", type=int, default=MAX_SCENARIOS)
+    parser.add_argument("--max-steps-per-scenario", type=int, default=MAX_STEPS_PER_SCENARIO)
+    parser.add_argument(
+        "--max-assertions-per-step",
+        type=int,
+        default=MAX_ASSERTIONS_PER_STEP,
+    )
+    parser.add_argument("--default-chaos-seed", type=int, default=DEFAULT_CHAOS_SEED)
+    parser.add_argument(
+        "--enable-live-events",
+        action=argparse.BooleanOptionalAction,
+        default=ENABLE_LIVE_EVENTS,
+    )
+    parser.add_argument("--event-buffer-size", type=int, default=EVENT_BUFFER_SIZE)
+    parser.add_argument("--event-heartbeat-secs", type=int, default=EVENT_HEARTBEAT_SECS)
+    parser.add_argument(
+        "--live-events-require-selectors",
+        action=argparse.BooleanOptionalAction,
+        default=LIVE_EVENTS_REQUIRE_SELECTORS,
+    )
+    parser.add_argument("--cli-refresh-ms", type=int, default=CLI_REFRESH_MS_DEFAULT)
+    parser.add_argument(
+        "--enable-target-proxy",
+        action=argparse.BooleanOptionalAction,
+        default=ENABLE_TARGET_PROXY,
+    )
+    parser.add_argument("--target-state-file", default=TARGET_STATE_FILE)
+    parser.add_argument("--max-targets", type=int, default=MAX_TARGETS)
+    parser.add_argument("--demo-token", default=DEMO_TOKEN)
+    parser.add_argument(
+        "--require-demo-token",
+        action=argparse.BooleanOptionalAction,
+        default=REQUIRE_DEMO_TOKEN,
+    )
+    parser.add_argument("--public-base-url", default=PUBLIC_BASE_URL)
     return parser.parse_args()
 
 
@@ -1759,6 +2732,23 @@ if __name__ == "__main__":
         state_file=args.state_file,
         history_limit=args.history_limit,
         max_mock_body_bytes=args.max_mock_body_bytes,
+        enable_scenarios=args.enable_scenarios,
+        scenario_state_file=args.scenario_state_file,
+        max_scenarios=args.max_scenarios,
+        max_steps_per_scenario=args.max_steps_per_scenario,
+        max_assertions_per_step=args.max_assertions_per_step,
+        default_chaos_seed=args.default_chaos_seed,
+        enable_live_events=args.enable_live_events,
+        event_buffer_size=args.event_buffer_size,
+        event_heartbeat_secs=args.event_heartbeat_secs,
+        live_events_require_selectors=args.live_events_require_selectors,
+        cli_refresh_ms_default=args.cli_refresh_ms,
+        enable_target_proxy=args.enable_target_proxy,
+        target_state_file=args.target_state_file,
+        max_targets=args.max_targets,
+        demo_token=args.demo_token,
+        require_demo_token=args.require_demo_token,
+        public_base_url=args.public_base_url,
     )
     _install_signal_handlers(server)
     try:

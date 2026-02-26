@@ -1,0 +1,52 @@
+{
+  "name": "User lifecycle",
+  "description": "Create and verify a mock-backed user endpoint",
+  "defaults": {
+    "stop_on_fail": true
+  },
+  "steps": [
+    {
+      "id": "create-user-mock",
+      "name": "Create mock endpoint",
+      "method": "POST",
+      "path": "/api/mocks",
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"method\":\"POST\",\"path_pattern\":\"/api/users\",\"status\":201,\"headers\":{\"X-Mock-Server\":\"custom\"},\"body\":\"{\\\"id\\\":101,\\\"name\\\":\\\"Demo User\\\"}\",\"content_type\":\"application/json\"}",
+      "expect": {
+        "status": [200, 201],
+        "body_contains": [
+          "mock"
+        ]
+      }
+    },
+    {
+      "id": "request-user",
+      "name": "Request mocked user",
+      "method": "POST",
+      "path": "/api/users",
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"name\":\"Rahat\"}",
+      "delay_ms": 50,
+      "chaos": {
+        "enabled": true,
+        "mode": "status_flip",
+        "probability": 0.25,
+        "seed_offset": 7
+      },
+      "expect": {
+        "status": 201,
+        "body_contains": [
+          "Demo User"
+        ],
+        "header_equals": {
+          "x-mock-server": "custom"
+        },
+        "max_latency_ms": 500
+      }
+    }
+  ]
+}

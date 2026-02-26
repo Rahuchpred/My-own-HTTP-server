@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import socket
+import ssl
 from dataclasses import dataclass
 from typing import Callable
 
@@ -284,7 +285,10 @@ def write_http_response_message(
             file_size = prepared.file_path.stat().st_size
             remaining = file_size
             offset = 0
-            if hasattr(os, "sendfile"):
+            can_use_sendfile = hasattr(os, "sendfile") and not isinstance(
+                client_socket, ssl.SSLSocket
+            )
+            if can_use_sendfile:
                 while remaining > 0:
                     sent = os.sendfile(
                         client_socket.fileno(),

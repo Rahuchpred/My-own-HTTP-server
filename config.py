@@ -1,7 +1,9 @@
 """Configuration constants for the custom HTTP server."""
 
+import os
+
 HOST: str = "127.0.0.1"
-PORT: int = 8080
+PORT: int = int(os.getenv("PORT", "8080"))
 HTTPS_PORT: int = 8443
 BUFFER_SIZE: int = 1024
 READ_CHUNK_SIZE: int = 4096
@@ -36,4 +38,25 @@ STATE_FILE: str = "data/server_state.json"
 HISTORY_LIMIT: int = 500
 MAX_MOCK_BODY_BYTES: int = 262_144
 MAX_MOCK_ROUTES: int = 200
+ENABLE_SCENARIOS: bool = True
+SCENARIO_STATE_FILE: str = "data/scenarios_state.json"
+MAX_SCENARIOS: int = 100
+MAX_STEPS_PER_SCENARIO: int = 50
+MAX_ASSERTIONS_PER_STEP: int = 20
+DEFAULT_CHAOS_SEED: int = 1337
+ENABLE_LIVE_EVENTS: bool = True
+EVENT_BUFFER_SIZE: int = 5000
+EVENT_HEARTBEAT_SECS: int = 5
+CLI_REFRESH_MS_DEFAULT: int = 100
+ENABLE_TARGET_PROXY: bool = True
+TARGET_STATE_FILE: str = "data/targets_state.json"
+MAX_TARGETS: int = 50
+DEMO_TOKEN: str = os.getenv("DEMO_TOKEN", "")
+REQUIRE_DEMO_TOKEN: bool = os.getenv("REQUIRE_DEMO_TOKEN", "false").lower() == "true"
+PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
+LIVE_EVENTS_REQUIRE_SELECTORS: bool = True
+ENABLE_INCIDENT_MODE: bool = True
+INCIDENT_DEFAULT_PROBABILITY: float = 0.5
+INCIDENT_DEFAULT_LATENCY_MS: int = 2000
+INCIDENT_MAX_LATENCY_MS: int = 10000
 DEBUG: bool = True
