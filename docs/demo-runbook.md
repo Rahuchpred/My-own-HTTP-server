@@ -1,126 +1,126 @@
-# Final Demo Runbook
+# Final Demo Runbook (V3)
 
-This runbook is optimized for a high-impact recording that proves the server is built from low-level primitives, not framework glue.
+This runbook is optimized for a recording that proves secure transport, graceful lifecycle handling, and deep observability on top of your from-scratch HTTP stack.
 
 ## Goal
 
-Show protocol-level behavior, non-blocking engine architecture, and measurable performance gates in one cohesive walkthrough.
+Show TLS-first serving, HTTP redirect behavior, graceful draining semantics, and route-level latency metrics in one cohesive demo.
 
 ## Prerequisites
 
 - Python 3.11+
 - Dependencies installed (`python3 -m pip install -r requirements-dev.txt`)
-- Free local port 8080 (or pass `--port`)
+- OpenSSL available (`openssl version`)
 
-## Step 1: Start the selectors engine
+## Step 0: Generate dev certificates
 
 ```bash
-python3 server.py --engine selectors --log-format json
+tools/generate_dev_cert.sh certs
 ```
 
-Keep this terminal visible for structured logs (`engine`, `connection_id`, `request_id`, `latency_ms`).
+This creates:
 
-## Step 2: Open the live dashboard
+- `certs/dev-cert.pem`
+- `certs/dev-key.pem`
+
+## Step 1: Start server in TLS mode
+
+```bash
+python3 server.py \
+  --engine selectors \
+  --enable-tls \
+  --cert-file certs/dev-cert.pem \
+  --key-file certs/dev-key.pem \
+  --port 8080 \
+  --https-port 8443 \
+  --redirect-http \
+  --log-format json
+```
+
+Call out in logs:
+
+- `trace_id`
+- `route_key`
+- `shutdown_phase`
+- `drain_elapsed_ms`
+
+## Step 2: Prove HTTP -> HTTPS redirect
+
+```bash
+curl -i http://127.0.0.1:8080/static/test.html
+```
+
+Expected: `308 Permanent Redirect` with `Location: https://127.0.0.1:8443/static/test.html`.
+
+## Step 3: Prove HTTPS request handling
+
+```bash
+curl -k -i https://127.0.0.1:8443/
+curl -k -i https://127.0.0.1:8443/_metrics
+```
+
+Expected: normal application responses over TLS.
+
+## Step 4: Open live dashboard over HTTPS
 
 In a browser, open:
 
 ```text
-http://127.0.0.1:8080/static/dashboard.html
+https://127.0.0.1:8443/static/dashboard.html
 ```
 
-You should see counters updating every second via `GET /_metrics`.
+(accept local cert warning once)
 
-## Step 3: Prove strict protocol behavior
-
-Run these commands in another terminal:
+## Step 5: Show protocol strictness over TLS
 
 ```bash
-# Missing Host in HTTP/1.1 -> 400
-printf 'GET / HTTP/1.1\r\nConnection: close\r\n\r\n' | nc 127.0.0.1 8080
-
-# Unsupported version -> 505
-printf 'GET / HTTP/2.0\r\nHost: localhost\r\nConnection: close\r\n\r\n' | nc 127.0.0.1 8080
+printf 'GET / HTTP/2.0\r\nHost: localhost\r\nConnection: close\r\n\r\n' | openssl s_client -quiet -connect 127.0.0.1:8443
 ```
 
-Call out that these are parser-level checks, not route-level behavior.
+Call out `505 HTTP Version Not Supported`.
 
-## Step 4: Show interim `100 Continue`
-
-Send headers first:
+## Step 6: Load + observability
 
 ```bash
-printf 'POST /submit HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 4\r\nConnection: close\r\n\r\n' | nc 127.0.0.1 8080
+python3 tools/loadgen.py --host 127.0.0.1 --port 8443 --path / --concurrency 200 --duration 20 --keepalive --pipeline-depth 4
 ```
 
-You should see `HTTP/1.1 100 Continue` before the final response in compliant client flows.
-
-## Step 5: Show pipelined ordering
-
-Use this one-shot Python snippet:
+Then query metrics:
 
 ```bash
-python3 - <<'PY'
-import socket
-
-payload = (
-    b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n"
-    b"GET /missing HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-)
-with socket.create_connection(("127.0.0.1", 8080), timeout=2) as sock:
-    sock.sendall(payload)
-    print(sock.recv(4096).decode("iso-8859-1", errors="replace"))
-    print(sock.recv(4096).decode("iso-8859-1", errors="replace"))
-PY
+curl -k -s https://127.0.0.1:8443/_metrics | python3 -m json.tool
 ```
 
-Explain that responses stay ordered under pipelined input.
+Highlight:
 
-## Step 6: Run stress profile with keep-alive + pipeline
+- `requests_by_route`
+- `latency_by_route_ms` (`p50/p95/p99`)
+- `error_counts_by_class`
+- `request_trace_id`
 
-```bash
-python3 tools/loadgen.py --host 127.0.0.1 --port 8080 --path / --concurrency 200 --duration 20 --keepalive --pipeline-depth 4
-```
+## Step 7: Graceful drain demo
 
-Then run a heavier profile if needed:
+With load still running (or immediately after), stop server with `Ctrl+C`.
 
-```bash
-python3 tools/loadgen.py --host 127.0.0.1 --port 8080 --path / --concurrency 500 --duration 30 --keepalive --pipeline-depth 4
-```
+Call out behavior:
 
-## Step 7: Compare engines with hard gates
+- server enters draining phase
+- in-flight work completes
+- post-drain requests get `503` + `Retry-After`
+- logs include `shutdown_phase=draining` and `drain_elapsed_ms`
+
+## Step 8: Optional engine comparison
 
 ```bash
 python3 tools/compare_engines.py --path / --concurrency 200 --duration 10 --keepalive --pipeline-depth 4
 ```
 
-Use the output to show:
-
-- threadpool vs selectors throughput and latency
-- strict gate checks:
-  - selectors error rate `<= 1%`
-  - selectors p95 `<= 200ms`
-  - selectors RPS `>= 1.8x` threadpool
-
-## What to call out during demo
-
-- The request parser returns protocol-specific statuses (`400`, `414`, `431`, `501`, `505`).
-- `Expect: 100-continue` and pipelined response ordering are implemented manually.
-- Static files are sent incrementally (not fully buffered).
-- `/_metrics` and dashboard move in real time under load.
-- Engine comparison is repeatable and gate-based, not anecdotal.
+Use this to reinforce that complexity is measurable, not just cosmetic.
 
 ## Quick health commands
 
 ```bash
+curl -k -i https://127.0.0.1:8443/
+curl -k -i https://127.0.0.1:8443/_metrics
 curl -i http://127.0.0.1:8080/
-curl -i http://127.0.0.1:8080/_metrics
-curl -i http://127.0.0.1:8080/static/dashboard.html
-```
-
-## Legacy baseline run (optional)
-
-To compare legacy concurrency behavior:
-
-```bash
-python3 server.py
 ```

@@ -2,9 +2,11 @@
 
 Custom HTTP/1.1 server implemented from scratch in Python using raw TCP sockets.
 
-## Features (V2)
+## Features (V3)
 
 - Raw TCP socket server (`AF_INET`, `SOCK_STREAM`)
+- HTTPS/TLS listener with secure defaults (TLS 1.2+)
+- Optional HTTP -> HTTPS redirect listener (`308 Permanent Redirect`)
 - Dual runtime engines:
   - `threadpool` engine (bounded worker pool)
   - `selectors` engine (non-blocking event loop)
@@ -22,8 +24,10 @@ Custom HTTP/1.1 server implemented from scratch in Python using raw TCP sockets.
 - `Expect: 100-continue` support
 - Auto protocol headers: `Date`, `Server`, `Connection`, `Keep-Alive`
 - Static cache validators (`ETag`, `Last-Modified`, `304 Not Modified`)
+- Graceful shutdown + connection draining with `Retry-After` rejection for post-drain requests
 - Built-in metrics endpoint: `GET /_metrics`
-- Structured access logs with engine, connection id, request id, bytes, latency
+- Route-level latency summaries (`p50/p95/p99`) and error-class counters
+- Structured access logs with engine, connection id, request id, trace id, shutdown phase
 - Load-testing and benchmark tooling (`tools/loadgen.py`, `tools/compare_engines.py`)
 
 ## Architecture
@@ -58,6 +62,8 @@ TCP accept ----> | Engine Selector     | ----> threadpool engine
 | Chunked request body decode | Yes |
 | Chunked response stream encode | Yes |
 | `Expect: 100-continue` | Yes |
+| HTTPS/TLS server mode | Yes |
+| HTTP -> HTTPS redirect | Yes |
 
 ## Routes
 
@@ -93,6 +99,7 @@ TCP accept ----> | Engine Selector     | ----> threadpool engine
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
+tools/generate_dev_cert.sh certs
 ```
 
 ## Run Server
@@ -109,6 +116,12 @@ Selectors engine with JSON logs:
 python3 server.py --engine selectors --log-format json
 ```
 
+TLS mode with redirect:
+
+```bash
+python3 server.py --enable-tls --cert-file certs/dev-cert.pem --key-file certs/dev-key.pem --https-port 8443 --redirect-http
+```
+
 Server CLI options:
 
 - `--host` (default `127.0.0.1`)
@@ -116,6 +129,9 @@ Server CLI options:
 - `--engine` (`threadpool` or `selectors`)
 - `--max-connections`
 - `--keepalive-timeout`
+- `--enable-tls`, `--cert-file`, `--key-file`, `--https-port`
+- `--redirect-http` / `--no-redirect-http`
+- `--drain-timeout`
 - `--log-format` (`plain` or `json`)
 
 ## Tuning Knobs
@@ -127,9 +143,11 @@ Defined in `config.py`:
 - `MAX_ACTIVE_CONNECTIONS`
 - `KEEPALIVE_TIMEOUT_SECS`, `MAX_KEEPALIVE_REQUESTS`
 - `SELECT_TIMEOUT_SECS`, `IDLE_SWEEP_INTERVAL_SECS`
+- `DRAIN_TIMEOUT_SECS`, `SHUTDOWN_POLL_INTERVAL_SECS`
 - `READ_CHUNK_SIZE`, `WRITE_CHUNK_SIZE`
 - `MAX_HEADER_BYTES`, `MAX_BODY_BYTES`, `MAX_REQUEST_BYTES`, `MAX_TARGET_LENGTH`
 - `ENABLE_EXPECT_CONTINUE`
+- `ENABLE_TLS`, `TLS_CERT_FILE`, `TLS_KEY_FILE`, `HTTPS_PORT`, `REDIRECT_HTTP_TO_HTTPS`
 - `SERVER_NAME`
 
 ## Manual Checks
@@ -147,6 +165,13 @@ Expect/continue quick check:
 
 ```bash
 printf 'POST /submit HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 4\r\nConnection: close\r\n\r\n' | nc 127.0.0.1 8080
+```
+
+TLS quick check:
+
+```bash
+curl -k -i https://127.0.0.1:8443/
+curl -i http://127.0.0.1:8080/
 ```
 
 ## Performance Benchmarking
@@ -187,6 +212,9 @@ python3 -m pytest -q
 - `100 Continue` not observed:
   - send headers first with `Expect: 100-continue`
   - do not send body bytes before waiting for interim response
+- TLS startup fails:
+  - verify cert/key files exist and are readable
+  - regenerate local certs with `tools/generate_dev_cert.sh certs`
 - Frequent `503 Service Unavailable` under load:
   - increase `WORKER_COUNT` and `REQUEST_QUEUE_SIZE` for threadpool runs
   - lower concurrency or switch to `--engine selectors`
