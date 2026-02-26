@@ -81,6 +81,11 @@ def test_inflight_request_completes_while_server_is_draining() -> None:
             b"Connection: close\r\n"
             b"\r\n"
         )
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            if server.metrics.snapshot().get("inflight_requests", 0) > 0:
+                break
+            time.sleep(0.01)
         stopper = threading.Thread(target=server.stop)
         stopper.start()
         response = _recv_http_response(sock)

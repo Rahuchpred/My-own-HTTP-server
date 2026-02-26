@@ -135,6 +135,33 @@ def test_https_request_succeeds_with_tls_enabled(
     assert b"Hello World" in response
 
 
+@pytest.mark.parametrize("engine", ["threadpool", "selectors"])
+def test_https_static_file_body_is_returned(
+    engine: str,
+    tls_files: tuple[Path, Path],
+) -> None:
+    cert_file, key_file = tls_files
+    server, thread = _start_server(engine=engine, cert_file=cert_file, key_file=key_file)
+    try:
+        client_context = ssl.create_default_context()
+        client_context.check_hostname = False
+        client_context.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((server.host, server.port), timeout=3) as raw_sock:
+            with client_context.wrap_socket(raw_sock, server_hostname="localhost") as tls_sock:
+                tls_sock.sendall(
+                    b"GET /static/dashboard.html HTTP/1.1\r\n"
+                    b"Host: localhost\r\n"
+                    b"Connection: close\r\n"
+                    b"\r\n"
+                )
+                response = _recv_http_response(tls_sock)
+    finally:
+        _stop_server(server, thread)
+
+    assert response.startswith(b"HTTP/1.1 200 OK")
+    assert b"HTTP Server Live Metrics" in response
+
+
 def test_http_listener_redirects_to_https(tls_files: tuple[Path, Path]) -> None:
     cert_file, key_file = tls_files
     server, thread = _start_server(engine="threadpool", cert_file=cert_file, key_file=key_file)

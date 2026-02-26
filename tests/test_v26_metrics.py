@@ -30,7 +30,34 @@ def _stop_server(server: HTTPServer, thread: threading.Thread) -> None:
 def _send(host: str, port: int, payload: bytes) -> bytes:
     with socket.create_connection((host, port), timeout=2) as sock:
         sock.sendall(payload)
-        return sock.recv(8192)
+        buffer = bytearray()
+        while b"\r\n\r\n" not in buffer:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buffer.extend(chunk)
+
+        header_end = buffer.find(b"\r\n\r\n")
+        if header_end == -1:
+            return bytes(buffer)
+
+        head = bytes(buffer[:header_end])
+        body = bytes(buffer[header_end + 4 :])
+        headers: dict[bytes, bytes] = {}
+        for line in head.split(b"\r\n")[1:]:
+            if b":" not in line:
+                continue
+            key, value = line.split(b":", 1)
+            headers[key.strip().lower()] = value.strip().lower()
+
+        content_length = int(headers.get(b"content-length", b"0"))
+        while len(body) < content_length:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            body += chunk
+
+        return head + b"\r\n\r\n" + body
 
 
 def test_metrics_endpoint_reports_request_counters() -> None:
