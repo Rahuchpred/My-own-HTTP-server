@@ -8,10 +8,11 @@ def test_demo_runbook_contains_required_demo_steps() -> None:
     content = runbook_path.read_text(encoding="utf-8")
 
     required_phrases = [
-        "python3 server.py",
-        "python3 tools/loadgen.py",
-        "https://127.0.0.1:8443/static/dashboard.html",
-        "Step 7: Graceful drain demo",
+        "scripts/start_server.sh",
+        "https://127.0.0.1:8443/playground",
+        "Create Mock",
+        "curl -k -i https://127.0.0.1:8443/api/history",
+        "End with graceful shutdown",
     ]
     for phrase in required_phrases:
         assert phrase in content

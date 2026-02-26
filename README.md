@@ -2,7 +2,7 @@
 
 Custom HTTP/1.1 server implemented from scratch in Python using raw TCP sockets.
 
-## Features (V3)
+## Features (V4)
 
 - Raw TCP socket server (`AF_INET`, `SOCK_STREAM`)
 - HTTPS/TLS listener with secure defaults (TLS 1.2+)
@@ -26,8 +26,13 @@ Custom HTTP/1.1 server implemented from scratch in Python using raw TCP sockets.
 - Static cache validators (`ETag`, `Last-Modified`, `304 Not Modified`)
 - Graceful shutdown + connection draining with `Retry-After` rejection for post-drain requests
 - Built-in metrics endpoint: `GET /_metrics`
+- Built-in API Playground at `GET /playground` (mini-Postman style request lab)
+- Dynamic mock API with persistence:
+  - `POST /api/mocks`, `PUT /api/mocks/{id}`, `DELETE /api/mocks/{id}`, `GET /api/mocks`
+  - `GET /api/history`, `POST /api/replay/{request_id}`, `GET /api/playground/state`
+- JSON-file state persistence (`data/server_state.json`) for mock routes and request history
 - Route-level latency summaries (`p50/p95/p99`) and error-class counters
-- Structured access logs with engine, connection id, request id, trace id, shutdown phase
+- Structured access logs with engine, connection id, request id, trace id, shutdown phase, playground actions
 - Load-testing and benchmark tooling (`tools/loadgen.py`, `tools/compare_engines.py`)
 
 ## Architecture
@@ -70,8 +75,16 @@ TCP accept ----> | Engine Selector     | ----> threadpool engine
 - `GET /` -> Hello world text response
 - `GET /stream` -> chunked demo response
 - `POST /submit` -> echoes submitted body
+- `GET /playground` -> API Playground UI
 - `GET /static/*` -> serve static files
 - `GET /_metrics` -> JSON metrics snapshot
+- `GET /api/mocks` -> list mock routes
+- `POST /api/mocks` -> create mock route
+- `PUT /api/mocks/{id}` -> update mock route
+- `DELETE /api/mocks/{id}` -> delete mock route
+- `GET /api/history` -> list captured request history
+- `POST /api/replay/{request_id}` -> replay a captured request
+- `GET /api/playground/state` -> current playground state snapshot
 - `HEAD` supported for routed/static/metrics endpoints
 
 ## Project Structure
@@ -104,6 +117,26 @@ tools/generate_dev_cert.sh certs
 
 ## Run Server
 
+Fastest way (recommended):
+
+```bash
+scripts/start_server.sh
+```
+
+This starts TLS mode (`https://127.0.0.1:8443`) and auto-generates local certs if missing.
+
+Plain HTTP mode:
+
+```bash
+scripts/start_server.sh http
+```
+
+Preview command without starting:
+
+```bash
+scripts/start_server.sh --dry-run
+```
+
 Default (threadpool engine):
 
 ```bash
@@ -133,6 +166,10 @@ Server CLI options:
 - `--redirect-http` / `--no-redirect-http`
 - `--drain-timeout`
 - `--log-format` (`plain` or `json`)
+- `--enable-playground` / `--no-enable-playground`
+- `--state-file` (default `data/server_state.json`)
+- `--history-limit` (default `500`)
+- `--max-mock-body-bytes` (default `262144`)
 
 ## Tuning Knobs
 
@@ -148,6 +185,7 @@ Defined in `config.py`:
 - `MAX_HEADER_BYTES`, `MAX_BODY_BYTES`, `MAX_REQUEST_BYTES`, `MAX_TARGET_LENGTH`
 - `ENABLE_EXPECT_CONTINUE`
 - `ENABLE_TLS`, `TLS_CERT_FILE`, `TLS_KEY_FILE`, `HTTPS_PORT`, `REDIRECT_HTTP_TO_HTTPS`
+- `ENABLE_PLAYGROUND`, `STATE_FILE`, `HISTORY_LIMIT`, `MAX_MOCK_BODY_BYTES`, `MAX_MOCK_ROUTES`
 - `SERVER_NAME`
 
 ## Manual Checks
@@ -172,6 +210,18 @@ TLS quick check:
 ```bash
 curl -k -i https://127.0.0.1:8443/
 curl -i http://127.0.0.1:8080/
+```
+
+Playground quick check:
+
+```bash
+curl -k -i https://127.0.0.1:8443/playground
+curl -k -i https://127.0.0.1:8443/api/playground/state
+curl -k -i -X POST https://127.0.0.1:8443/api/mocks \
+  -H 'Content-Type: application/json' \
+  -d '{"method":"POST","path_pattern":"/api/users","status":201,"headers":{"X-Mock-Server":"custom"},"body":"{\"created\":true}","content_type":"application/json"}'
+curl -k -i -X POST https://127.0.0.1:8443/api/users
+curl -k -i https://127.0.0.1:8443/api/history
 ```
 
 ## Performance Benchmarking

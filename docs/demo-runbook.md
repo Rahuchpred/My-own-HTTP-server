@@ -1,126 +1,95 @@
-# Final Demo Runbook (V3)
+# Final Demo Runbook (V4)
 
-This runbook is optimized for a recording that proves secure transport, graceful lifecycle handling, and deep observability on top of your from-scratch HTTP stack.
+This runbook is optimized for a 60-90 second recording that looks useful and technically deep.
 
 ## Goal
 
-Show TLS-first serving, HTTP redirect behavior, graceful draining semantics, and route-level latency metrics in one cohesive demo.
+Show a real HTTPS server with a built-in API Playground that can create mocks, send requests, inspect responses, and replay traffic.
 
 ## Prerequisites
 
 - Python 3.11+
 - Dependencies installed (`python3 -m pip install -r requirements-dev.txt`)
-- OpenSSL available (`openssl version`)
 
-## Step 0: Generate dev certificates
-
-```bash
-tools/generate_dev_cert.sh certs
-```
-
-This creates:
-
-- `certs/dev-cert.pem`
-- `certs/dev-key.pem`
-
-## Step 1: Start server in TLS mode
+## 1) Start server with one command
 
 ```bash
-python3 server.py \
-  --engine selectors \
-  --enable-tls \
-  --cert-file certs/dev-cert.pem \
-  --key-file certs/dev-key.pem \
-  --port 8080 \
-  --https-port 8443 \
-  --redirect-http \
-  --log-format json
+scripts/start_server.sh
 ```
 
-Call out in logs:
+## 2) Open the app
 
-- `trace_id`
-- `route_key`
-- `shutdown_phase`
-- `drain_elapsed_ms`
-
-## Step 2: Prove HTTP -> HTTPS redirect
-
-```bash
-curl -i http://127.0.0.1:8080/static/test.html
-```
-
-Expected: `308 Permanent Redirect` with `Location: https://127.0.0.1:8443/static/test.html`.
-
-## Step 3: Prove HTTPS request handling
-
-```bash
-curl -k -i https://127.0.0.1:8443/
-curl -k -i https://127.0.0.1:8443/_metrics
-```
-
-Expected: normal application responses over TLS.
-
-## Step 4: Open live dashboard over HTTPS
-
-In a browser, open:
+Open in browser:
 
 ```text
-https://127.0.0.1:8443/static/dashboard.html
+https://127.0.0.1:8443/playground
 ```
 
-(accept local cert warning once)
+Call out:
+- request builder (method/path/headers/body)
+- mock manager
+- history + replay
+- trace and latency in UI/logs
 
-## Step 5: Show protocol strictness over TLS
+## 3) Create a real mock from UI
+
+Create mock:
+- method: `POST`
+- path: `/api/users`
+- status: `201`
+- body: `{"id":101,"name":"Demo User","source":"mock"}`
+
+Click **Create Mock**.
+
+## 4) Send live request from playground
+
+In Request Lab, send:
+- method: `POST`
+- path: `/api/users`
+
+Show response panel:
+- status `201`
+- response headers/body
+- latency
+
+## 5) Show history + replay
+
+In history panel:
+- pick latest `/api/users` entry
+- click **Replay**
+- show new history row appears
+
+## 6) Prove with terminal commands
+
+Run in second terminal:
 
 ```bash
-printf 'GET / HTTP/2.0\r\nHost: localhost\r\nConnection: close\r\n\r\n' | openssl s_client -quiet -connect 127.0.0.1:8443
+curl -k -i https://127.0.0.1:8443/api/playground/state
+curl -k -i https://127.0.0.1:8443/api/history
+curl -k -i https://127.0.0.1:8443/_metrics
 ```
 
-Call out `505 HTTP Version Not Supported`.
-
-## Step 6: Load + observability
-
-```bash
-python3 tools/loadgen.py --host 127.0.0.1 --port 8443 --path / --concurrency 200 --duration 20 --keepalive --pipeline-depth 4
-```
-
-Then query metrics:
-
-```bash
-curl -k -s https://127.0.0.1:8443/_metrics | python3 -m json.tool
-```
-
-Highlight:
-
-- `requests_by_route`
-- `latency_by_route_ms` (`p50/p95/p99`)
-- `error_counts_by_class`
+Highlight metrics keys:
+- `playground_mock_count`
+- `playground_history_count`
+- `playground_replay_total`
 - `request_trace_id`
 
-## Step 7: Graceful drain demo
-
-With load still running (or immediately after), stop server with `Ctrl+C`.
-
-Call out behavior:
-
-- server enters draining phase
-- in-flight work completes
-- post-drain requests get `503` + `Retry-After`
-- logs include `shutdown_phase=draining` and `drain_elapsed_ms`
-
-## Step 8: Optional engine comparison
+## 7) Show HTTPS + redirect proof
 
 ```bash
-python3 tools/compare_engines.py --path / --concurrency 200 --duration 10 --keepalive --pipeline-depth 4
-```
-
-Use this to reinforce that complexity is measurable, not just cosmetic.
-
-## Quick health commands
-
-```bash
-curl -k -i https://127.0.0.1:8443/
-curl -k -i https://127.0.0.1:8443/_metrics
 curl -i http://127.0.0.1:8080/
+curl -k -i https://127.0.0.1:8443/
 ```
+
+Expected:
+- HTTP returns `308 Permanent Redirect`
+- HTTPS serves normal `200` response
+
+## 8) End with graceful shutdown
+
+Stop server with `Ctrl+C` in server terminal.
+
+Call out:
+- draining shutdown lifecycle
+- structured logs with trace IDs and route keys
