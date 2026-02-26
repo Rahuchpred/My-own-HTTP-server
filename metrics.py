@@ -21,6 +21,14 @@ class MetricsRegistry:
         self._bytes_sent_total = 0
         self._read_errors_by_type: Counter[str] = Counter()
         self._write_errors_by_type: Counter[str] = Counter()
+        self._error_counts_by_class: Counter[str] = Counter()
+        self._requests_by_route: Counter[str] = Counter()
+        self._status_by_route: dict[str, Counter[str]] = {}
+        self._latencies_by_route_ms: dict[str, list[float]] = {}
+        self._last_request_trace_id = ""
+        self._drain_state = "running"
+        self._drain_inflight_remaining = 0
+        self._drain_elapsed_ms = 0.0
 
     def connection_opened(self) -> None:
         with self._lock:
@@ -42,23 +50,65 @@ class MetricsRegistry:
         with self._lock:
             self._inflight_requests = max(0, self._inflight_requests - 1)
 
-    def record_request(self, status_code: int, duration_ms: float, bytes_sent: int) -> None:
+    def record_request(
+        self,
+        status_code: int,
+        duration_ms: float,
+        bytes_sent: int,
+        *,
+        route_key: str | None = None,
+        trace_id: str | None = None,
+    ) -> None:
         with self._lock:
             self._total_requests += 1
             self._status_counts[str(status_code)] += 1
             self._bytes_sent_total += bytes_sent
             self._latency_buckets[self._bucket_label(duration_ms)] += 1
+            if route_key is not None:
+                self._requests_by_route[route_key] += 1
+                if route_key not in self._status_by_route:
+                    self._status_by_route[route_key] = Counter()
+                self._status_by_route[route_key][str(status_code)] += 1
+                latencies = self._latencies_by_route_ms.setdefault(route_key, [])
+                latencies.append(duration_ms)
+                # Keep bounded memory usage for long runs.
+                if len(latencies) > 4096:
+                    del latencies[: len(latencies) - 4096]
+            if trace_id is not None:
+                self._last_request_trace_id = trace_id
 
     def record_read_error(self, error_type: str) -> None:
         with self._lock:
             self._read_errors_by_type[error_type] += 1
+            self._error_counts_by_class["read"] += 1
 
     def record_write_error(self, error_type: str) -> None:
         with self._lock:
             self._write_errors_by_type[error_type] += 1
+            self._error_counts_by_class["write"] += 1
+
+    def record_error_class(self, error_class: str) -> None:
+        with self._lock:
+            self._error_counts_by_class[error_class] += 1
+
+    def set_drain_state(
+        self,
+        *,
+        state: str,
+        inflight_remaining: int,
+        elapsed_ms: float,
+    ) -> None:
+        with self._lock:
+            self._drain_state = state
+            self._drain_inflight_remaining = inflight_remaining
+            self._drain_elapsed_ms = round(elapsed_ms, 3)
 
     def snapshot(self) -> dict[str, object]:
         with self._lock:
+            latency_by_route = {
+                route_key: self._route_latency_summary(latencies)
+                for route_key, latencies in self._latencies_by_route_ms.items()
+            }
             return {
                 "total_requests": self._total_requests,
                 "active_connections": self._active_connections,
@@ -70,6 +120,18 @@ class MetricsRegistry:
                 "bytes_sent_total": self._bytes_sent_total,
                 "read_errors_by_type": dict(self._read_errors_by_type),
                 "write_errors_by_type": dict(self._write_errors_by_type),
+                "error_counts_by_class": dict(self._error_counts_by_class),
+                "requests_by_route": dict(self._requests_by_route),
+                "status_by_route": {
+                    route_key: dict(statuses)
+                    for route_key, statuses in self._status_by_route.items()
+                },
+                "latency_by_route_ms": latency_by_route,
+                "latency_p99_ms": self._overall_latency_percentile(99),
+                "request_trace_id": self._last_request_trace_id,
+                "drain_state": self._drain_state,
+                "drain_inflight_remaining": self._drain_inflight_remaining,
+                "drain_elapsed_ms": self._drain_elapsed_ms,
             }
 
     def _bucket_label(self, duration_ms: float) -> str:
@@ -77,3 +139,31 @@ class MetricsRegistry:
             if duration_ms <= limit:
                 return f"<= {limit}ms"
         return "> 5000ms"
+
+    def _route_latency_summary(self, latencies: list[float]) -> dict[str, float]:
+        return {
+            "p50": round(self._percentile(latencies, 50), 3),
+            "p95": round(self._percentile(latencies, 95), 3),
+            "p99": round(self._percentile(latencies, 99), 3),
+        }
+
+    def _overall_latency_percentile(self, percentile: int) -> float:
+        all_values: list[float] = []
+        for values in self._latencies_by_route_ms.values():
+            all_values.extend(values)
+        return round(self._percentile(all_values, percentile), 3)
+
+    def _percentile(self, values: list[float], percentile: int) -> float:
+        if not values:
+            return 0.0
+        if percentile <= 0:
+            return min(values)
+        if percentile >= 100:
+            return max(values)
+
+        ordered = sorted(values)
+        rank = (len(ordered) - 1) * (percentile / 100)
+        lower = int(rank)
+        upper = min(lower + 1, len(ordered) - 1)
+        weight = rank - lower
+        return ordered[lower] * (1 - weight) + ordered[upper] * weight

@@ -7,26 +7,37 @@ import json
 import logging
 import os
 import selectors
+import signal
 import socket
+import ssl
+import threading
 import time
+import uuid
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import BinaryIO
 
 from config import (
+    DRAIN_TIMEOUT_SECS,
     ENABLE_EXPECT_CONTINUE,
+    ENABLE_TLS,
     HOST,
+    HTTPS_PORT,
     IDLE_SWEEP_INTERVAL_SECS,
     KEEPALIVE_TIMEOUT_SECS,
     LOG_FORMAT,
     MAX_ACTIVE_CONNECTIONS,
     MAX_KEEPALIVE_REQUESTS,
     PORT,
+    REDIRECT_HTTP_TO_HTTPS,
     REQUEST_QUEUE_SIZE,
     SELECT_TIMEOUT_SECS,
     SERVER_ENGINE,
+    SHUTDOWN_POLL_INTERVAL_SECS,
     SOCKET_TIMEOUT_SECS,
+    TLS_CERT_FILE,
+    TLS_KEY_FILE,
     WORKER_COUNT,
     WRITE_CHUNK_SIZE,
 )
@@ -63,6 +74,8 @@ class OutboundResponse:
     connection_id: int
     request_id: int
     bytes_in: int
+    route_key: str
+    trace_id: str
     close_after: bool
     metrics_started: bool
     pending_chunks: deque[memoryview] = field(default_factory=deque)
@@ -84,6 +97,8 @@ class OutboundResponse:
         connection_id: int,
         request_id: int,
         bytes_in: int,
+        route_key: str,
+        trace_id: str,
         close_after: bool,
         metrics_started: bool,
     ) -> "OutboundResponse":
@@ -97,6 +112,8 @@ class OutboundResponse:
             connection_id=connection_id,
             request_id=request_id,
             bytes_in=bytes_in,
+            route_key=route_key,
+            trace_id=trace_id,
             close_after=close_after,
             metrics_started=metrics_started,
         )
@@ -132,6 +149,15 @@ class ConnectionState:
     continue_sent_headers: set[int] = field(default_factory=set)
 
 
+@dataclass(slots=True)
+class TLSConfig:
+    enabled: bool
+    cert_file: str
+    key_file: str
+    https_port: int
+    redirect_http_to_https: bool
+
+
 class HTTPServer:
     def __init__(
         self,
@@ -144,24 +170,48 @@ class HTTPServer:
         engine: str = SERVER_ENGINE,
         max_active_connections: int = MAX_ACTIVE_CONNECTIONS,
         keepalive_timeout_secs: int = KEEPALIVE_TIMEOUT_SECS,
+        enable_tls: bool = ENABLE_TLS,
+        tls_cert_file: str = TLS_CERT_FILE,
+        tls_key_file: str = TLS_KEY_FILE,
+        https_port: int = HTTPS_PORT,
+        redirect_http_to_https: bool = REDIRECT_HTTP_TO_HTTPS,
+        drain_timeout_secs: float = DRAIN_TIMEOUT_SECS,
         log_format: str = LOG_FORMAT,
     ) -> None:
         self.host = host
         self.port = port
+        self.http_port = port
+        self.https_port = https_port
         self.router = router or self._build_default_router()
         self.worker_count = worker_count
         self.request_queue_size = request_queue_size
         self.engine = engine
         self.max_active_connections = max_active_connections
         self.keepalive_timeout_secs = keepalive_timeout_secs
+        self.drain_timeout_secs = drain_timeout_secs
         self.log_format = log_format
 
+        self.tls_config = TLSConfig(
+            enabled=enable_tls,
+            cert_file=tls_cert_file,
+            key_file=tls_key_file,
+            https_port=https_port,
+            redirect_http_to_https=redirect_http_to_https,
+        )
+        self._ssl_context: ssl.SSLContext | None = None
         self._server_socket: socket.socket | None = None
+        self._redirect_socket: socket.socket | None = None
+        self._redirect_thread: threading.Thread | None = None
         self._pool: ThreadPool | None = None
         self._selector: selectors.BaseSelector | None = None
         self._selector_connections: dict[int, ConnectionState] = {}
         self._next_connection_id = 0
         self._running = False
+        self._accepting = False
+        self._lifecycle_state = "stopped"
+        self._drain_started_at = 0.0
+        self._drain_elapsed_ms = 0.0
+        self._state_lock = threading.Lock()
         self.metrics = MetricsRegistry()
 
     def _build_default_router(self) -> Router:
@@ -171,8 +221,124 @@ class HTTPServer:
         router.add_route("POST", "/submit", submit)
         return router
 
+    def _build_ssl_context(self) -> ssl.SSLContext:
+        if not self.tls_config.enabled:
+            raise RuntimeError("TLS is disabled")
+        cert_file = self.tls_config.cert_file
+        key_file = self.tls_config.key_file
+        if not os.path.exists(cert_file):
+            raise FileNotFoundError(f"TLS certificate file not found: {cert_file}")
+        if not os.path.exists(key_file):
+            raise FileNotFoundError(f"TLS private key file not found: {key_file}")
+
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20")
+        context.load_cert_chain(certfile=cert_file, keyfile=key_file)
+        return context
+
+    def _set_lifecycle_state(self, state: str) -> None:
+        with self._state_lock:
+            self._lifecycle_state = state
+            self.metrics.set_drain_state(
+                state=state,
+                inflight_remaining=self._inflight_remaining(),
+                elapsed_ms=self._drain_elapsed_ms,
+            )
+
+    def _inflight_remaining(self) -> int:
+        snapshot = self.metrics.snapshot()
+        inflight = int(snapshot.get("inflight_requests", 0))
+        if self.engine == "selectors":
+            inflight += len(self._selector_connections)
+        return inflight
+
+    def _is_draining(self) -> bool:
+        return self._lifecycle_state == "draining"
+
+    def _start_redirect_listener(self) -> None:
+        if not self.tls_config.enabled or not self.tls_config.redirect_http_to_https:
+            return
+
+        redirect_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        redirect_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        redirect_socket.bind((self.host, self.http_port))
+        redirect_socket.listen(128)
+        redirect_socket.settimeout(0.2)
+        self._redirect_socket = redirect_socket
+        self.http_port = redirect_socket.getsockname()[1]
+
+        thread = threading.Thread(target=self._redirect_loop, daemon=True)
+        thread.start()
+        self._redirect_thread = thread
+
+    def _redirect_loop(self) -> None:
+        assert self._redirect_socket is not None
+        while self._running and self._accepting:
+            try:
+                client_socket, _address = self._redirect_socket.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            with client_socket:
+                try:
+                    client_socket.settimeout(1.0)
+                    data = bytearray()
+                    while b"\r\n\r\n" not in data and len(data) < 8192:
+                        chunk = client_socket.recv(1024)
+                        if not chunk:
+                            break
+                        data.extend(chunk)
+                    location = self._redirect_location(bytes(data))
+                    response = HTTPResponse(
+                        status_code=308,
+                        reason_phrase="Permanent Redirect",
+                        headers={
+                            "Location": location,
+                            "Connection": "close",
+                            "Cache-Control": "no-store",
+                        },
+                        body="Use HTTPS",
+                    )
+                    write_http_response_message(client_socket, response)
+                except OSError:
+                    continue
+
+    def _redirect_location(self, raw_request: bytes) -> str:
+        host = self.host
+        target = "/"
+        if raw_request:
+            try:
+                head = raw_request.split(b"\r\n\r\n", 1)[0].decode("iso-8859-1")
+                lines = head.split("\r\n")
+                if lines and lines[0]:
+                    parts = lines[0].split(" ")
+                    if len(parts) >= 2 and parts[1]:
+                        target = parts[1]
+                for line in lines[1:]:
+                    if ":" not in line:
+                        continue
+                    name, value = line.split(":", 1)
+                    if name.strip().lower() == "host":
+                        host = value.strip().split(":")[0]
+                        break
+            except Exception:
+                pass
+        return f"https://{host}:{self.https_port}{target}"
+
     def start(self) -> None:
         """Start listening and process clients according to selected engine."""
+        self._running = True
+        self._accepting = True
+        self._drain_elapsed_ms = 0.0
+        self._set_lifecycle_state("running")
+        if self.tls_config.enabled:
+            self._ssl_context = self._build_ssl_context()
+            self.https_port = self.tls_config.https_port
+            self._start_redirect_listener()
+
         if self.engine == "threadpool":
             self._start_threadpool()
             return
@@ -182,13 +348,18 @@ class HTTPServer:
         raise ValueError(f"Unsupported engine: {self.engine}")
 
     def _start_threadpool(self) -> None:
+        bind_port = self.https_port if self.tls_config.enabled else self.port
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
             self._server_socket = server_socket
             server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.bind((self.host, self.port))
+            server_socket.bind((self.host, bind_port))
             server_socket.listen(128)
             server_socket.settimeout(0.2)
-            self.port = server_socket.getsockname()[1]
+            if self.tls_config.enabled:
+                self.https_port = server_socket.getsockname()[1]
+                self.port = self.https_port
+            else:
+                self.port = server_socket.getsockname()[1]
             self._pool = ThreadPool(
                 worker_count=self.worker_count,
                 queue_size=self.request_queue_size,
@@ -196,7 +367,6 @@ class HTTPServer:
             )
             self._pool.start()
 
-            self._running = True
             try:
                 while self._running:
                     try:
@@ -206,14 +376,27 @@ class HTTPServer:
                     except OSError:
                         break
 
+                    if self._is_draining():
+                        self._send_drain_reject_response(client_socket)
+                        continue
+
+                    if self.tls_config.enabled:
+                        wrapped = self._wrap_server_socket(client_socket)
+                        if wrapped is None:
+                            continue
+                        client_socket = wrapped
+
                     if self._pool is None or not self._pool.submit(client_socket, address):
                         self._send_queue_full_response(client_socket)
             finally:
                 if self._pool is not None:
-                    self._pool.shutdown()
+                    self._pool.shutdown(graceful=True, timeout=self.drain_timeout_secs)
                     self._pool = None
+                self._stop_redirect_listener()
+                self._set_lifecycle_state("stopped")
 
     def _start_selectors(self) -> None:
+        bind_port = self.https_port if self.tls_config.enabled else self.port
         with (
             socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket,
             selectors.DefaultSelector() as selector,
@@ -221,12 +404,15 @@ class HTTPServer:
             self._server_socket = server_socket
             self._selector = selector
             server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.bind((self.host, self.port))
+            server_socket.bind((self.host, bind_port))
             server_socket.listen(128)
             server_socket.setblocking(False)
             selector.register(server_socket, selectors.EVENT_READ, data=None)
-            self.port = server_socket.getsockname()[1]
-            self._running = True
+            if self.tls_config.enabled:
+                self.https_port = server_socket.getsockname()[1]
+                self.port = self.https_port
+            else:
+                self.port = server_socket.getsockname()[1]
 
             last_idle_sweep = time.monotonic()
             try:
@@ -240,7 +426,8 @@ class HTTPServer:
 
                     for key, mask in events:
                         if key.data is None:
-                            self._accept_selector_clients(server_socket, selector)
+                            if self._accepting:
+                                self._accept_selector_clients(server_socket, selector)
                             continue
 
                         state: ConnectionState = key.data
@@ -253,31 +440,110 @@ class HTTPServer:
                     if now - last_idle_sweep >= IDLE_SWEEP_INTERVAL_SECS:
                         self._sweep_idle_connections(selector, now)
                         last_idle_sweep = now
+                    if self._is_draining():
+                        self._update_drain_metrics()
+                        if now - self._drain_started_at >= self.drain_timeout_secs:
+                            self._running = False
+                            break
+                        if not self._selector_connections and self.metrics.snapshot().get(
+                            "inflight_requests", 0
+                        ) == 0:
+                            self._running = False
+                            break
             finally:
                 for state in list(self._selector_connections.values()):
                     self._close_selector_connection(state, selector)
                 self._selector_connections.clear()
                 self._selector = None
+                self._stop_redirect_listener()
+                self._set_lifecycle_state("stopped")
 
     def stop(self) -> None:
-        self._running = False
+        if not self._running:
+            return
+
+        self._accepting = False
+        self._set_lifecycle_state("draining")
+        self._drain_started_at = time.monotonic()
+        self._update_drain_metrics()
+
         if self._server_socket is not None:
             self._server_socket.close()
             self._server_socket = None
-        if self._pool is not None:
-            self._pool.shutdown()
-            self._pool = None
+        self._stop_redirect_listener()
 
-    def _send_queue_full_response(self, client_socket: socket.socket) -> None:
+        deadline = time.monotonic() + self.drain_timeout_secs
+        while time.monotonic() < deadline:
+            inflight_remaining = self._inflight_remaining()
+            self._update_drain_metrics()
+            if inflight_remaining == 0:
+                break
+            time.sleep(SHUTDOWN_POLL_INTERVAL_SECS)
+
+        self._running = False
+        self._drain_elapsed_ms = max(0.0, (time.monotonic() - self._drain_started_at) * 1000)
+        self._update_drain_metrics()
+
+        if self._pool is not None:
+            self._pool.shutdown(graceful=True, timeout=self.drain_timeout_secs)
+            self._pool = None
+        if self._selector is not None:
+            for state in list(self._selector_connections.values()):
+                self._close_selector_connection(state, self._selector)
+            self._selector_connections.clear()
+
+    def _update_drain_metrics(self) -> None:
+        if self._lifecycle_state != "draining":
+            return
+        self._drain_elapsed_ms = max(0.0, (time.monotonic() - self._drain_started_at) * 1000)
+        self.metrics.set_drain_state(
+            state="draining",
+            inflight_remaining=self._inflight_remaining(),
+            elapsed_ms=self._drain_elapsed_ms,
+        )
+
+    def _stop_redirect_listener(self) -> None:
+        if self._redirect_socket is not None:
+            try:
+                self._redirect_socket.close()
+            except OSError:
+                pass
+            self._redirect_socket = None
+        if self._redirect_thread is not None:
+            self._redirect_thread.join(timeout=1.0)
+            self._redirect_thread = None
+
+    def _wrap_server_socket(self, client_socket: socket.socket) -> ssl.SSLSocket | None:
+        if self._ssl_context is None:
+            return None
+        try:
+            client_socket.settimeout(SOCKET_TIMEOUT_SECS)
+            wrapped = self._ssl_context.wrap_socket(client_socket, server_side=True)
+            wrapped.settimeout(SOCKET_TIMEOUT_SECS)
+            return wrapped
+        except ssl.SSLError as exc:
+            self.metrics.record_error_class("tls_handshake")
+            logger.warning("tls_handshake_failed error=%s", exc)
+            try:
+                client_socket.close()
+            except OSError:
+                pass
+            return None
+
+    def _send_drain_reject_response(self, client_socket: socket.socket) -> None:
         with client_socket:
             started_at = time.perf_counter()
             response = HTTPResponse(
                 status_code=503,
                 reason_phrase="Service Unavailable",
-                headers={"Connection": "close"},
-                body="Service Unavailable",
+                headers={
+                    "Connection": "close",
+                    "Retry-After": "2",
+                },
+                body="Server Draining",
             )
             bytes_sent = write_http_response_message(client_socket, response)
+            trace_id = self._new_trace_id()
             self._record_and_log(
                 address=("-", 0),
                 method="-",
@@ -289,7 +555,40 @@ class HTTPServer:
                 connection_reused=False,
                 connection_id=0,
                 request_id=0,
+                route_key="drain/reject",
+                trace_id=trace_id,
+                shutdown_phase="draining",
             )
+
+    def _send_queue_full_response(self, client_socket: socket.socket) -> None:
+        with client_socket:
+            started_at = time.perf_counter()
+            response = HTTPResponse(
+                status_code=503,
+                reason_phrase="Service Unavailable",
+                headers={"Connection": "close"},
+                body="Service Unavailable",
+            )
+            bytes_sent = write_http_response_message(client_socket, response)
+            trace_id = self._new_trace_id()
+            self._record_and_log(
+                address=("-", 0),
+                method="-",
+                path="-",
+                response=response,
+                payload_size=bytes_sent,
+                bytes_in=0,
+                started_at=started_at,
+                connection_reused=False,
+                connection_id=0,
+                request_id=0,
+                route_key="queue/full",
+                trace_id=trace_id,
+                shutdown_phase=self._lifecycle_state,
+            )
+
+    def _new_trace_id(self) -> str:
+        return uuid.uuid4().hex[:16]
 
     def _handle_client(self, client_socket: socket.socket, address: tuple[str, int]) -> None:
         with client_socket:
@@ -300,6 +599,7 @@ class HTTPServer:
             try:
                 while request_count < MAX_KEEPALIVE_REQUESTS:
                     started_at = time.perf_counter()
+                    trace_id = self._new_trace_id()
                     sent_continue = False
 
                     def send_continue(_head_info: object) -> None:
@@ -330,6 +630,8 @@ class HTTPServer:
                             connection_reused=False,
                             connection_id=0,
                             request_id=0,
+                            route_key="request/too_large",
+                            trace_id=trace_id,
                         )
                         return
                     except HeaderTooLargeError as exc:
@@ -351,6 +653,8 @@ class HTTPServer:
                             connection_reused=False,
                             connection_id=0,
                             request_id=0,
+                            route_key="request/header_too_large",
+                            trace_id=trace_id,
                         )
                         return
                     except SocketTimeoutError as exc:
@@ -369,6 +673,8 @@ class HTTPServer:
                             connection_reused=False,
                             connection_id=0,
                             request_id=0,
+                            route_key="request/timeout",
+                            trace_id=trace_id,
                         )
                         return
                     except MalformedRequestError as exc:
@@ -387,6 +693,8 @@ class HTTPServer:
                             connection_reused=False,
                             connection_id=0,
                             request_id=0,
+                            route_key="request/malformed",
+                            trace_id=trace_id,
                         )
                         return
                     except OSError:
@@ -398,6 +706,7 @@ class HTTPServer:
                     try:
                         request = HTTPRequest.from_bytes(raw_request)
                     except HTTPRequestParseError as exc:
+                        self.metrics.record_error_class("parse")
                         response = HTTPResponse(
                             status_code=exc.status_code,
                             body=REASON_PHRASES.get(exc.status_code, "Bad Request"),
@@ -415,9 +724,12 @@ class HTTPServer:
                             connection_reused=False,
                             connection_id=0,
                             request_id=0,
+                            route_key="request/parse_error",
+                            trace_id=trace_id,
                         )
                         return
                     except ValueError:
+                        self.metrics.record_error_class("parse")
                         response = HTTPResponse(status_code=400, body="Bad Request")
                         response.headers.setdefault("Connection", "close")
                         bytes_sent = write_http_response_message(client_socket, response)
@@ -432,13 +744,41 @@ class HTTPServer:
                             connection_reused=False,
                             connection_id=0,
                             request_id=0,
+                            route_key="request/bad_request",
+                            trace_id=trace_id,
                         )
                         return
 
                     request_count += 1
                     connection_reused = request_count > 1
+                    if (self._is_draining() or not self._accepting) and request_count > 1:
+                        response = HTTPResponse(
+                            status_code=503,
+                            headers={"Retry-After": "2"},
+                            body="Server Draining",
+                        )
+                        response.headers.setdefault("Connection", "close")
+                        response.headers["X-Request-ID"] = trace_id
+                        bytes_sent = write_http_response_message(client_socket, response)
+                        self._record_and_log(
+                            address=address,
+                            method=request.method,
+                            path=request.path,
+                            response=response,
+                            payload_size=bytes_sent,
+                            bytes_in=len(raw_request),
+                            started_at=started_at,
+                            connection_reused=connection_reused,
+                            connection_id=0,
+                            request_id=request_count,
+                            route_key=f"{request.method} {request.path}",
+                            trace_id=trace_id,
+                            shutdown_phase="draining",
+                        )
+                        return
                     self.metrics.request_started(connection_reused=connection_reused)
                     response = self._dispatch(request)
+                    response.headers.setdefault("X-Request-ID", trace_id)
                     should_close = (
                         (not request.keep_alive)
                         or request_count >= MAX_KEEPALIVE_REQUESTS
@@ -474,6 +814,8 @@ class HTTPServer:
                         connection_reused=connection_reused,
                         connection_id=0,
                         request_id=request_count,
+                        route_key=f"{request.method} {request.path}",
+                        trace_id=trace_id,
                     )
                     if should_close:
                         return
@@ -494,8 +836,28 @@ class HTTPServer:
                 return
 
             if len(self._selector_connections) >= self.max_active_connections:
+                if self.tls_config.enabled:
+                    wrapped_full = self._wrap_server_socket(client_socket)
+                    if wrapped_full is not None:
+                        self._send_queue_full_response(wrapped_full)
+                    continue
                 self._send_queue_full_response(client_socket)
                 continue
+
+            if self._is_draining():
+                if self.tls_config.enabled:
+                    wrapped_drain = self._wrap_server_socket(client_socket)
+                    if wrapped_drain is not None:
+                        self._send_drain_reject_response(wrapped_drain)
+                    continue
+                self._send_drain_reject_response(client_socket)
+                continue
+
+            if self.tls_config.enabled:
+                wrapped = self._wrap_server_socket(client_socket)
+                if wrapped is None:
+                    continue
+                client_socket = wrapped
 
             client_socket.setblocking(False)
             self._next_connection_id += 1
@@ -590,10 +952,12 @@ class HTTPServer:
             state.recv_buffer = bytearray(leftover)
             state.continue_sent_headers.clear()
             started_at = time.perf_counter()
+            trace_id = self._new_trace_id()
 
             try:
                 request = HTTPRequest.from_bytes(raw_request)
             except HTTPRequestParseError as exc:
+                self.metrics.record_error_class("parse")
                 self._queue_selector_response(
                     state,
                     HTTPResponse(
@@ -606,12 +970,15 @@ class HTTPServer:
                     connection_reused=state.requests_served > 0,
                     request_id=state.request_seq + 1,
                     bytes_in=len(raw_request),
+                    route_key="request/parse_error",
+                    trace_id=trace_id,
                     close_after=True,
                     metrics_started=False,
                 )
                 state.closing = True
                 break
             except ValueError:
+                self.metrics.record_error_class("parse")
                 self._queue_selector_response(
                     state,
                     HTTPResponse(status_code=400, body="Bad Request"),
@@ -621,6 +988,8 @@ class HTTPServer:
                     connection_reused=state.requests_served > 0,
                     request_id=state.request_seq + 1,
                     bytes_in=len(raw_request),
+                    route_key="request/bad_request",
+                    trace_id=trace_id,
                     close_after=True,
                     metrics_started=False,
                 )
@@ -630,9 +999,33 @@ class HTTPServer:
             state.requests_served += 1
             state.request_seq += 1
             connection_reused = state.requests_served > 1
+            if (self._is_draining() or not self._accepting) and state.requests_served > 1:
+                draining_response = HTTPResponse(
+                    status_code=503,
+                    headers={"Retry-After": "2"},
+                    body="Server Draining",
+                )
+                draining_response.headers["X-Request-ID"] = trace_id
+                self._queue_selector_response(
+                    state,
+                    draining_response,
+                    method=request.method,
+                    path=request.path,
+                    started_at=started_at,
+                    connection_reused=connection_reused,
+                    request_id=state.request_seq,
+                    bytes_in=len(raw_request),
+                    route_key=f"{request.method} {request.path}",
+                    trace_id=trace_id,
+                    close_after=True,
+                    metrics_started=False,
+                )
+                state.closing = True
+                break
             self.metrics.request_started(connection_reused=connection_reused)
 
             response = self._dispatch(request)
+            response.headers.setdefault("X-Request-ID", trace_id)
             should_close = (
                 (not request.keep_alive)
                 or state.requests_served >= MAX_KEEPALIVE_REQUESTS
@@ -658,6 +1051,8 @@ class HTTPServer:
                 connection_reused=connection_reused,
                 request_id=state.request_seq,
                 bytes_in=len(raw_request),
+                route_key=f"{request.method} {request.path}",
+                trace_id=trace_id,
                 close_after=should_close,
                 metrics_started=True,
             )
@@ -700,6 +1095,8 @@ class HTTPServer:
         connection_reused: bool,
         request_id: int,
         bytes_in: int,
+        route_key: str | None = None,
+        trace_id: str | None = None,
         close_after: bool,
         metrics_started: bool,
     ) -> None:
@@ -714,6 +1111,8 @@ class HTTPServer:
             connection_id=state.connection_id,
             request_id=request_id,
             bytes_in=bytes_in,
+            route_key=route_key or f"{method} {path}",
+            trace_id=trace_id or self._new_trace_id(),
             close_after=close_after,
             metrics_started=metrics_started,
         )
@@ -853,6 +1252,8 @@ class HTTPServer:
             connection_reused=outbound.connection_reused,
             connection_id=outbound.connection_id,
             request_id=outbound.request_id,
+            route_key=outbound.route_key,
+            trace_id=outbound.trace_id,
         )
 
         if outbound.close_after:
@@ -986,6 +1387,7 @@ class HTTPServer:
             try:
                 return self._as_head_response(handler(request))
             except Exception:
+                self.metrics.record_error_class("dispatch")
                 logger.exception("Unhandled error in HEAD route handler")
                 return self._as_head_response(
                     HTTPResponse(status_code=500, body="Internal Server Error")
@@ -998,6 +1400,7 @@ class HTTPServer:
         try:
             return handler(request)
         except Exception:
+            self.metrics.record_error_class("dispatch")
             logger.exception("Unhandled error in route handler")
             return HTTPResponse(status_code=500, body="Internal Server Error")
 
@@ -1014,12 +1417,23 @@ class HTTPServer:
         connection_reused: bool,
         connection_id: int,
         request_id: int,
+        route_key: str | None = None,
+        trace_id: str | None = None,
+        shutdown_phase: str | None = None,
     ) -> None:
         duration_ms = (time.perf_counter() - started_at) * 1000
         self.metrics.record_request(
             status_code=response.status_code,
             duration_ms=duration_ms,
             bytes_sent=payload_size,
+            route_key=route_key,
+            trace_id=trace_id,
+        )
+        drain_elapsed_ms = round(
+            max(0.0, (time.monotonic() - self._drain_started_at) * 1000)
+            if self._lifecycle_state == "draining"
+            else 0.0,
+            3,
         )
         event = {
             "client": address[0],
@@ -1033,6 +1447,10 @@ class HTTPServer:
             "bytes_out": payload_size,
             "latency_ms": round(duration_ms, 3),
             "connection_reused": connection_reused,
+            "route_key": route_key or f"{method} {path}",
+            "trace_id": trace_id or "",
+            "shutdown_phase": shutdown_phase or self._lifecycle_state,
+            "drain_elapsed_ms": drain_elapsed_ms,
         }
         if self.log_format == "json":
             logger.info(json.dumps(event, sort_keys=True))
@@ -1042,7 +1460,8 @@ class HTTPServer:
             (
                 "client=%s method=%s path=%s status=%s engine=%s "
                 "connection_id=%s request_id=%s bytes_in=%s bytes_out=%s "
-                "duration_ms=%.2f connection_reused=%s"
+                "duration_ms=%.2f connection_reused=%s route_key=%s "
+                "trace_id=%s shutdown_phase=%s drain_elapsed_ms=%.2f"
             ),
             event["client"],
             event["method"],
@@ -1055,6 +1474,10 @@ class HTTPServer:
             event["bytes_out"],
             duration_ms,
             event["connection_reused"],
+            event["route_key"],
+            event["trace_id"],
+            event["shutdown_phase"],
+            event["drain_elapsed_ms"],
         )
 
     def _request_with_method(self, request: HTTPRequest, method: str) -> HTTPRequest:
@@ -1107,11 +1530,31 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run custom HTTP server")
     parser.add_argument("--host", default=HOST)
     parser.add_argument("--port", type=int, default=PORT)
+    parser.add_argument("--enable-tls", action="store_true", default=ENABLE_TLS)
+    parser.add_argument("--cert-file", default=TLS_CERT_FILE)
+    parser.add_argument("--key-file", default=TLS_KEY_FILE)
+    parser.add_argument("--https-port", type=int, default=HTTPS_PORT)
+    parser.add_argument(
+        "--redirect-http",
+        action=argparse.BooleanOptionalAction,
+        default=REDIRECT_HTTP_TO_HTTPS,
+    )
+    parser.add_argument("--drain-timeout", type=float, default=DRAIN_TIMEOUT_SECS)
     parser.add_argument("--engine", choices=["threadpool", "selectors"], default=SERVER_ENGINE)
     parser.add_argument("--max-connections", type=int, default=MAX_ACTIVE_CONNECTIONS)
     parser.add_argument("--keepalive-timeout", type=int, default=KEEPALIVE_TIMEOUT_SECS)
     parser.add_argument("--log-format", choices=["plain", "json"], default=LOG_FORMAT)
     return parser.parse_args()
+
+
+def _install_signal_handlers(server: HTTPServer) -> None:
+    def _handler(signum: int, _frame: object) -> None:
+        signal_name = signal.Signals(signum).name
+        logger.info("signal_received signal=%s action=drain_and_stop", signal_name)
+        server.stop()
+
+    signal.signal(signal.SIGINT, _handler)
+    signal.signal(signal.SIGTERM, _handler)
 
 
 if __name__ == "__main__":
@@ -1123,8 +1566,15 @@ if __name__ == "__main__":
         engine=args.engine,
         max_active_connections=args.max_connections,
         keepalive_timeout_secs=args.keepalive_timeout,
+        enable_tls=args.enable_tls,
+        tls_cert_file=args.cert_file,
+        tls_key_file=args.key_file,
+        https_port=args.https_port,
+        redirect_http_to_https=args.redirect_http,
+        drain_timeout_secs=args.drain_timeout,
         log_format=args.log_format,
     )
+    _install_signal_handlers(server)
     try:
         server.start()
     except KeyboardInterrupt:
