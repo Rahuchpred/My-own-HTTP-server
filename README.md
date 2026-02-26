@@ -2,7 +2,7 @@
 
 Custom HTTP/1.1 server implemented from scratch in Python using raw TCP sockets.
 
-## Features (V4)
+## Features (V5.1)
 
 - Raw TCP socket server (`AF_INET`, `SOCK_STREAM`)
 - HTTPS/TLS listener with secure defaults (TLS 1.2+)
@@ -30,6 +30,19 @@ Custom HTTP/1.1 server implemented from scratch in Python using raw TCP sockets.
 - Dynamic mock API with persistence:
   - `POST /api/mocks`, `PUT /api/mocks/{id}`, `DELETE /api/mocks/{id}`, `GET /api/mocks`
   - `GET /api/history`, `POST /api/replay/{request_id}`, `GET /api/playground/state`
+- Scenario Runner with assertions, delay, and deterministic chaos:
+  - scenario CRUD: `GET/POST /api/scenarios`, `GET/PUT/DELETE /api/scenarios/{id}`
+  - execution: `POST /api/scenarios/{id}/run`
+  - run history: `GET /api/scenarios/{id}/runs`, `GET /api/scenarios/runs/{run_id}`
+  - CLI: `tools/scenario_runner.py run`, `list`, `run-remote`, `live`, `proxy`
+- Live Ops event pipeline shared by CLI + web:
+  - `GET /api/events/snapshot`
+  - `GET /api/events/stream`
+- Named target proxying (Postman-like external routing via your server):
+  - `GET/POST /api/targets`, `PUT/DELETE /api/targets/{id}`
+  - `POST /api/proxy/request`
+- Optional demo token guard for admin/live/proxy APIs
+- Event-driven playground Control Tower (live requests, scenario timeline, proxy activity)
 - JSON-file state persistence (`data/server_state.json`) for mock routes and request history
 - Route-level latency summaries (`p50/p95/p99`) and error-class counters
 - Structured access logs with engine, connection id, request id, trace id, shutdown phase, playground actions
@@ -85,6 +98,21 @@ TCP accept ----> | Engine Selector     | ----> threadpool engine
 - `GET /api/history` -> list captured request history
 - `POST /api/replay/{request_id}` -> replay a captured request
 - `GET /api/playground/state` -> current playground state snapshot
+- `GET /api/scenarios` -> list scenarios
+- `POST /api/scenarios` -> create scenario
+- `GET /api/scenarios/{id}` -> fetch scenario
+- `PUT /api/scenarios/{id}` -> update scenario
+- `DELETE /api/scenarios/{id}` -> delete scenario
+- `POST /api/scenarios/{id}/run` -> execute scenario
+- `GET /api/scenarios/{id}/runs` -> list runs for scenario
+- `GET /api/scenarios/runs/{run_id}` -> fetch one run report
+- `GET /api/events/snapshot` -> pull event batches since cursor
+- `GET /api/events/stream` -> SSE event stream
+- `GET /api/targets` -> list proxy targets
+- `POST /api/targets` -> create proxy target
+- `PUT /api/targets/{id}` -> update target
+- `DELETE /api/targets/{id}` -> delete target
+- `POST /api/proxy/request` -> route request to a named target through this server
 - `HEAD` supported for routed/static/metrics endpoints
 
 ## Project Structure
@@ -170,6 +198,22 @@ Server CLI options:
 - `--state-file` (default `data/server_state.json`)
 - `--history-limit` (default `500`)
 - `--max-mock-body-bytes` (default `262144`)
+- `--enable-scenarios` / `--no-enable-scenarios`
+- `--scenario-state-file` (default `data/scenarios_state.json`)
+- `--max-scenarios` (default `100`)
+- `--max-steps-per-scenario` (default `50`)
+- `--max-assertions-per-step` (default `20`)
+- `--default-chaos-seed` (default `1337`)
+- `--enable-live-events` / `--no-enable-live-events`
+- `--event-buffer-size` (default `5000`)
+- `--event-heartbeat-secs` (default `5`)
+- `--live-events-require-selectors` / `--no-live-events-require-selectors`
+- `--cli-refresh-ms` (default `100`)
+- `--enable-target-proxy` / `--no-enable-target-proxy`
+- `--target-state-file` (default `data/targets_state.json`)
+- `--max-targets` (default `50`)
+- `--demo-token`, `--require-demo-token` / `--no-require-demo-token`
+- `--public-base-url`
 
 ## Tuning Knobs
 
@@ -186,6 +230,11 @@ Defined in `config.py`:
 - `ENABLE_EXPECT_CONTINUE`
 - `ENABLE_TLS`, `TLS_CERT_FILE`, `TLS_KEY_FILE`, `HTTPS_PORT`, `REDIRECT_HTTP_TO_HTTPS`
 - `ENABLE_PLAYGROUND`, `STATE_FILE`, `HISTORY_LIMIT`, `MAX_MOCK_BODY_BYTES`, `MAX_MOCK_ROUTES`
+- `ENABLE_SCENARIOS`, `SCENARIO_STATE_FILE`, `MAX_SCENARIOS`
+- `MAX_STEPS_PER_SCENARIO`, `MAX_ASSERTIONS_PER_STEP`, `DEFAULT_CHAOS_SEED`
+- `ENABLE_LIVE_EVENTS`, `EVENT_BUFFER_SIZE`, `EVENT_HEARTBEAT_SECS`, `CLI_REFRESH_MS_DEFAULT`
+- `ENABLE_TARGET_PROXY`, `TARGET_STATE_FILE`, `MAX_TARGETS`
+- `DEMO_TOKEN`, `REQUIRE_DEMO_TOKEN`, `PUBLIC_BASE_URL`
 - `SERVER_NAME`
 
 ## Manual Checks
@@ -222,6 +271,23 @@ curl -k -i -X POST https://127.0.0.1:8443/api/mocks \
   -d '{"method":"POST","path_pattern":"/api/users","status":201,"headers":{"X-Mock-Server":"custom"},"body":"{\"created\":true}","content_type":"application/json"}'
 curl -k -i -X POST https://127.0.0.1:8443/api/users
 curl -k -i https://127.0.0.1:8443/api/history
+```
+
+Scenario Runner quick check:
+
+```bash
+python3 tools/scenario_runner.py run examples/scenarios/user_lifecycle.json
+python3 tools/scenario_runner.py run examples/scenarios/user_lifecycle.json --seed 42
+python3 tools/scenario_runner.py list --server https://127.0.0.1:8443
+python3 tools/scenario_runner.py live --server https://127.0.0.1:8443
+python3 tools/scenario_runner.py proxy --server https://127.0.0.1:8443 --target-id <id> --method GET --path /
+```
+
+Live Ops quick check:
+
+```bash
+curl -k -i "https://127.0.0.1:8443/api/events/snapshot?since_id=0&limit=20"
+curl -k -i https://127.0.0.1:8443/api/events/stream
 ```
 
 ## Performance Benchmarking
