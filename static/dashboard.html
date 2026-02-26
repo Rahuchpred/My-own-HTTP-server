@@ -102,6 +102,18 @@
           <div class="label">Status 200</div>
           <div class="value" id="status200">0</div>
         </div>
+        <div class="card">
+          <div class="label">Open Connections</div>
+          <div class="value" id="openConnections">0</div>
+        </div>
+        <div class="card">
+          <div class="label">Inflight Requests</div>
+          <div class="value" id="inflightRequests">0</div>
+        </div>
+        <div class="card">
+          <div class="label">Reused Requests</div>
+          <div class="value" id="reusedRequests">0</div>
+        </div>
       </div>
 
       <div class="status">
@@ -128,6 +140,9 @@
           document.getElementById('activeConnections').textContent = data.active_connections ?? 0;
           document.getElementById('bytesSent').textContent = data.bytes_sent_total ?? 0;
           document.getElementById('status200').textContent = data.status_counts?.['200'] ?? 0;
+          document.getElementById('openConnections').textContent = data.open_connections ?? 0;
+          document.getElementById('inflightRequests').textContent = data.inflight_requests ?? 0;
+          document.getElementById('reusedRequests').textContent = data.requests_reused_connection ?? 0;
           document.getElementById('statusJson').textContent = JSON.stringify(data.status_counts ?? {}, null, 2);
           document.getElementById('latencyJson').textContent = JSON.stringify(data.latency_buckets_ms ?? {}, null, 2);
         } catch (_error) {

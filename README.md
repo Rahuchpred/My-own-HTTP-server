@@ -5,17 +5,59 @@ Custom HTTP/1.1 server implemented from scratch in Python using raw TCP sockets.
 ## Features (V2)
 
 - Raw TCP socket server (`AF_INET`, `SOCK_STREAM`)
-- Persistent HTTP/1.1 keep-alive connections with per-socket request loop
-- Bounded worker-pool concurrency with request queue backpressure (`503` on saturation)
-- Manual HTTP request parsing (`GET`, `POST`, `HEAD`)
+- Dual runtime engines:
+  - `threadpool` engine (bounded worker pool)
+  - `selectors` engine (non-blocking event loop)
+- Persistent HTTP/1.1 keep-alive connections
+- Pipelined request handling in selectors engine with ordered responses
 - Chunked request body decoding (`Transfer-Encoding: chunked`)
-- Manual HTTP response serialization with optional chunked streaming
+- Incremental chunked response streaming (no pre-buffered stream payload)
+- Incremental static-file delivery (`os.sendfile` when available, read-chunk fallback)
+- Protocol hardening:
+  - HTTP/1.1 Host header enforcement
+  - HTTP version checks (`505` for unsupported versions)
+  - request-target length checks (`414`)
+  - header-size checks (`431`)
+  - unknown method handling (`501`)
+- `Expect: 100-continue` support
 - Auto protocol headers: `Date`, `Server`, `Connection`, `Keep-Alive`
-- Method/path routing with `405` allow headers
-- Static file serving from `./static` with traversal protection
+- Static cache validators (`ETag`, `Last-Modified`, `304 Not Modified`)
 - Built-in metrics endpoint: `GET /_metrics`
-- Structured access logs (client, method, path, status, bytes, latency, reuse flag)
-- Basic safeguards: header/body/request limits and socket timeouts
+- Structured access logs with engine, connection id, request id, bytes, latency
+- Load-testing and benchmark tooling (`tools/loadgen.py`, `tools/compare_engines.py`)
+
+## Architecture
+
+```text
+                +----------------------+
+TCP accept ----> | Engine Selector     | ----> threadpool engine
+                | (threadpool/selectors)|
+                +----------+-----------+
+                           |
+                           +---------> selectors event loop
+                                        |  read buffer
+                                        |  parse/framing
+                                        |  dispatch/router
+                                        |  queued ordered writes
+                                        +--> socket send (body/stream/file)
+```
+
+## Protocol Matrix
+
+| Behavior | Implemented |
+| --- | --- |
+| HTTP/1.1 + HTTP/1.0 parsing | Yes |
+| Missing `Host` on HTTP/1.1 | `400 Bad Request` |
+| Unsupported version | `505 HTTP Version Not Supported` |
+| Unknown method token | `501 Not Implemented` |
+| Known but disallowed method | `405 Method Not Allowed` |
+| Oversized request target | `414 URI Too Long` |
+| Oversized headers | `431 Request Header Fields Too Large` |
+| Oversized body | `413 Payload Too Large` |
+| Keep-alive semantics | Yes |
+| Chunked request body decode | Yes |
+| Chunked response stream encode | Yes |
+| `Expect: 100-continue` | Yes |
 
 ## Routes
 
@@ -28,17 +70,19 @@ Custom HTTP/1.1 server implemented from scratch in Python using raw TCP sockets.
 
 ## Project Structure
 
-- `server.py`: accept loop, worker pool integration, dispatch, connection lifecycle
+- `server.py`: engine orchestration, lifecycle, dispatch, logging
 - `thread_pool.py`: fixed worker pool and bounded queue
-- `socket_handler.py`: framed request reading (content-length + chunked)
-- `request.py`: `HTTPRequest` model and parser
-- `response.py`: `HTTPResponse` model and serializer (fixed + chunked)
-- `metrics.py`: in-memory counters/histograms
+- `socket_handler.py`: framing/extraction utilities and incremental response writer
+- `request.py`: `HTTPRequest` model and strict parser
+- `response.py`: `HTTPResponse` model and serializer/preparer
+- `metrics.py`: in-memory metrics counters and latency buckets
 - `router.py`: route registry + lookup
 - `handlers/example_handlers.py`: route handlers
 - `utils.py`: static path + MIME helpers
 - `config.py`: runtime constants and tuning knobs
-- `tests/`: unit + integration + phased validation tests
+- `tools/loadgen.py`: async load generator (keep-alive + pipeline options)
+- `tools/compare_engines.py`: benchmark and gate checker
+- `tests/`: unit + integration + phase validation tests
 
 ## Requirements
 
@@ -53,25 +97,40 @@ python3 -m pip install -r requirements-dev.txt
 
 ## Run Server
 
+Default (threadpool engine):
+
 ```bash
 python3 server.py
 ```
 
-Server defaults:
+Selectors engine with JSON logs:
 
-- host: `127.0.0.1`
-- port: `8080`
+```bash
+python3 server.py --engine selectors --log-format json
+```
+
+Server CLI options:
+
+- `--host` (default `127.0.0.1`)
+- `--port` (default `8080`)
+- `--engine` (`threadpool` or `selectors`)
+- `--max-connections`
+- `--keepalive-timeout`
+- `--log-format` (`plain` or `json`)
 
 ## Tuning Knobs
 
 Defined in `config.py`:
 
-- `WORKER_COUNT`: fixed worker threads handling accepted sockets
-- `REQUEST_QUEUE_SIZE`: max queued accepted sockets
-- `KEEPALIVE_TIMEOUT_SECS`: idle timeout per keep-alive connection
-- `MAX_KEEPALIVE_REQUESTS`: max requests served per connection
-- `MAX_HEADER_BYTES`, `MAX_BODY_BYTES`, `MAX_REQUEST_BYTES`: safety limits
-- `SERVER_NAME`: default `Server` response header value
+- `SERVER_ENGINE`
+- `WORKER_COUNT`, `REQUEST_QUEUE_SIZE`
+- `MAX_ACTIVE_CONNECTIONS`
+- `KEEPALIVE_TIMEOUT_SECS`, `MAX_KEEPALIVE_REQUESTS`
+- `SELECT_TIMEOUT_SECS`, `IDLE_SWEEP_INTERVAL_SECS`
+- `READ_CHUNK_SIZE`, `WRITE_CHUNK_SIZE`
+- `MAX_HEADER_BYTES`, `MAX_BODY_BYTES`, `MAX_REQUEST_BYTES`, `MAX_TARGET_LENGTH`
+- `ENABLE_EXPECT_CONTINUE`
+- `SERVER_NAME`
 
 ## Manual Checks
 
@@ -84,6 +143,35 @@ curl -i http://127.0.0.1:8080/_metrics
 curl -i -X HEAD http://127.0.0.1:8080/
 ```
 
+Expect/continue quick check:
+
+```bash
+printf 'POST /submit HTTP/1.1\r\nHost: localhost\r\nExpect: 100-continue\r\nContent-Length: 4\r\nConnection: close\r\n\r\n' | nc 127.0.0.1 8080
+```
+
+## Performance Benchmarking
+
+Keep-alive + pipelined load:
+
+```bash
+python3 tools/loadgen.py --host 127.0.0.1 --port 8080 --path / --concurrency 200 --duration 20 --keepalive --pipeline-depth 4
+```
+
+Compare both engines and evaluate gates:
+
+```bash
+python3 tools/compare_engines.py --path / --concurrency 200 --duration 10 --keepalive --pipeline-depth 4
+```
+
+Output includes:
+
+- per-engine summary (`requests`, `error_rate`, `rps`, `p50`, `p95`)
+- markdown table for demo screenshots
+- gate checks:
+  - selectors error rate `<= 1%`
+  - selectors p95 `<= 200ms`
+  - selectors RPS `>= 1.8x` threadpool
+
 ## Automated Checks
 
 ```bash
@@ -94,16 +182,16 @@ python3 -m pytest -q
 ## Troubleshooting
 
 - Keep-alive client hangs:
-  - ensure client sends full HTTP request framing (`\r\n\r\n`, correct chunk/content-length)
-  - verify `Connection: close` is sent when you expect one-shot behavior
-- Chunked request rejected (`400`):
-  - check hex chunk sizes, chunk CRLF separators, and terminal `0\r\n\r\n`
-  - do not send `Content-Length` together with `Transfer-Encoding: chunked`
+  - ensure client sends full HTTP framing (`\r\n\r\n`, correct content-length/chunks)
+  - verify `Connection: close` if one-shot behavior is expected
+- `100 Continue` not observed:
+  - send headers first with `Expect: 100-continue`
+  - do not send body bytes before waiting for interim response
 - Frequent `503 Service Unavailable` under load:
-  - increase `WORKER_COUNT` and `REQUEST_QUEUE_SIZE`
-  - reduce per-request blocking work in handlers
-- Unexpected `413 Payload Too Large`:
-  - compare client payload size to `MAX_BODY_BYTES` and `MAX_REQUEST_BYTES`
+  - increase `WORKER_COUNT` and `REQUEST_QUEUE_SIZE` for threadpool runs
+  - lower concurrency or switch to `--engine selectors`
+- Unexpected `413`/`431`/`414`:
+  - compare request size and target length against limits in `config.py`
 
 ## Phase Auto-Commits
 
@@ -120,3 +208,9 @@ scripts/autocommit_phase.sh V39
 
 By default, the script pushes the active branch after a successful commit.
 Set `SKIP_PUSH=1` to skip push and keep local-only commits.
+
+## Demo Runbook
+
+For final showcase steps (server start, load profile, dashboard flow), use:
+
+- `docs/demo-runbook.md`
