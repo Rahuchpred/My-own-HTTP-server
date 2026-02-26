@@ -48,28 +48,7 @@ async def issue_request(host: str, port: int, path: str, timeout: float) -> tupl
         writer.write(request)
         await writer.drain()
 
-        status_line = await asyncio.wait_for(reader.readline(), timeout=timeout)
-        if not status_line.startswith(b"HTTP/"):
-            raise ValueError("Invalid status line")
-        parts = status_line.decode("iso-8859-1").strip().split(" ")
-        if len(parts) < 2:
-            raise ValueError("Malformed status line")
-        status = int(parts[1])
-
-        headers: dict[str, str] = {}
-        while True:
-            line = await asyncio.wait_for(reader.readline(), timeout=timeout)
-            if line in {b"\r\n", b"\n", b""}:
-                break
-            key, value = line.decode("iso-8859-1").strip().split(":", 1)
-            headers[key.strip().lower()] = value.strip()
-
-        if headers.get("transfer-encoding", "").lower() == "chunked":
-            await _read_chunked_body(reader, timeout=timeout)
-        else:
-            content_length = int(headers.get("content-length", "0"))
-            if content_length > 0:
-                await asyncio.wait_for(reader.readexactly(content_length), timeout=timeout)
+        status = await _read_status_and_body(reader, timeout=timeout)
 
         writer.close()
         await writer.wait_closed()
@@ -86,6 +65,8 @@ async def run_load(
     concurrency: int,
     duration_secs: float,
     timeout_secs: float,
+    keepalive: bool = False,
+    pipeline_depth: int = 1,
 ) -> LoadResult:
     status_counts: Counter[str] = Counter()
     latencies_ms: list[float] = []
@@ -93,18 +74,78 @@ async def run_load(
     errors = 0
     stop_at = time.perf_counter() + duration_secs
     lock = asyncio.Lock()
+    depth = max(1, pipeline_depth)
+
+    async def record(status: int, latency_ms: float, is_error: bool) -> None:
+        nonlocal total_requests, errors
+        async with lock:
+            total_requests += 1
+            latencies_ms.append(latency_ms)
+            if is_error:
+                errors += 1
+            else:
+                status_counts[str(status)] += 1
 
     async def worker() -> None:
-        nonlocal total_requests, errors
-        while time.perf_counter() < stop_at:
-            status, latency_ms, is_error = await issue_request(host, port, path, timeout_secs)
-            async with lock:
-                total_requests += 1
-                latencies_ms.append(latency_ms)
-                if is_error:
-                    errors += 1
-                else:
-                    status_counts[str(status)] += 1
+        if not keepalive:
+            while time.perf_counter() < stop_at:
+                status, latency_ms, is_error = await issue_request(host, port, path, timeout_secs)
+                await record(status, latency_ms, is_error)
+            return
+
+        reader: asyncio.StreamReader | None = None
+        writer: asyncio.StreamWriter | None = None
+        try:
+            while time.perf_counter() < stop_at:
+                if writer is None or writer.is_closing():
+                    try:
+                        reader, writer = await asyncio.wait_for(
+                            asyncio.open_connection(host, port),
+                            timeout=timeout_secs,
+                        )
+                    except Exception:
+                        await record(0, 0.0, True)
+                        continue
+
+                starts: list[float] = []
+                try:
+                    for _ in range(depth):
+                        if time.perf_counter() >= stop_at:
+                            break
+                        request = (
+                            f"GET {path} HTTP/1.1\r\n"
+                            f"Host: {host}:{port}\r\n"
+                            "Connection: keep-alive\r\n"
+                            "\r\n"
+                        ).encode("ascii")
+                        writer.write(request)
+                        starts.append(time.perf_counter())
+                    if not starts:
+                        break
+                    await writer.drain()
+
+                    for started in starts:
+                        status = await _read_status_and_body(reader, timeout=timeout_secs)
+                        await record(status, (time.perf_counter() - started) * 1000, False)
+                except Exception:
+                    now = time.perf_counter()
+                    for started in starts:
+                        await record(0, (now - started) * 1000, True)
+                    if writer is not None:
+                        writer.close()
+                        try:
+                            await writer.wait_closed()
+                        except Exception:
+                            pass
+                    reader = None
+                    writer = None
+        finally:
+            if writer is not None:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
     started = time.perf_counter()
     await asyncio.gather(*(worker() for _ in range(concurrency)))
@@ -117,6 +158,35 @@ async def run_load(
         latencies_ms=latencies_ms,
         duration_secs=duration,
     )
+
+
+async def _read_status_and_body(reader: asyncio.StreamReader, timeout: float) -> int:
+    status_line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+    if not status_line.startswith(b"HTTP/"):
+        raise ValueError("Invalid status line")
+    parts = status_line.decode("iso-8859-1").strip().split(" ")
+    if len(parts) < 2:
+        raise ValueError("Malformed status line")
+    status = int(parts[1])
+
+    headers: dict[str, str] = {}
+    while True:
+        line = await asyncio.wait_for(reader.readline(), timeout=timeout)
+        if line in {b"\r\n", b"\n", b""}:
+            break
+        if b":" not in line:
+            raise ValueError("Malformed header line")
+        key, value = line.decode("iso-8859-1").strip().split(":", 1)
+        headers[key.strip().lower()] = value.strip()
+
+    if headers.get("transfer-encoding", "").lower() == "chunked":
+        await _read_chunked_body(reader, timeout=timeout)
+    else:
+        content_length = int(headers.get("content-length", "0"))
+        if content_length > 0:
+            await asyncio.wait_for(reader.readexactly(content_length), timeout=timeout)
+
+    return status
 
 
 async def _read_chunked_body(reader: asyncio.StreamReader, timeout: float) -> None:
@@ -158,6 +228,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--concurrency", type=int, default=100)
     parser.add_argument("--duration", type=float, default=10.0)
     parser.add_argument("--timeout", type=float, default=2.0)
+    parser.add_argument("--keepalive", action="store_true")
+    parser.add_argument("--pipeline-depth", type=int, default=1)
     return parser.parse_args()
 
 
@@ -171,6 +243,8 @@ def main() -> None:
             concurrency=args.concurrency,
             duration_secs=args.duration,
             timeout_secs=args.timeout,
+            keepalive=args.keepalive,
+            pipeline_depth=args.pipeline_depth,
         )
     )
     print(json.dumps(result.summary(), indent=2, sort_keys=True))
