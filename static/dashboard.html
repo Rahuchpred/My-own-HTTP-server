@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>HTTP Server Live Dashboard</title>
+    <style>
+      :root {
+        --bg: #0f172a;
+        --panel: #111827;
+        --line: #1f2937;
+        --text: #e5e7eb;
+        --accent: #10b981;
+        --muted: #9ca3af;
+      }
+      body {
+        margin: 0;
+        background: radial-gradient(circle at top, #1f2937, var(--bg));
+        color: var(--text);
+        font-family: "Fira Sans", "Segoe UI", sans-serif;
+      }
+      .wrap {
+        max-width: 1080px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+      h1 {
+        margin: 0 0 16px;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+      }
+      .card {
+        background: linear-gradient(180deg, #1f2937, var(--panel));
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 16px;
+      }
+      .label {
+        color: var(--muted);
+        font-size: 12px;
+        margin-bottom: 6px;
+      }
+      .value {
+        font-size: 24px;
+        font-weight: 700;
+      }
+      .status {
+        margin-top: 16px;
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+      }
+      pre {
+        margin: 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .pulse {
+        display: inline-block;
+        width: 10px;
+        height: 10px;
+        background: var(--accent);
+        border-radius: 50%;
+        margin-right: 8px;
+        animation: pulse 1.5s infinite;
+      }
+      @keyframes pulse {
+        0% { opacity: 1; }
+        50% { opacity: 0.3; }
+        100% { opacity: 1; }
+      }
+      @media (max-width: 900px) {
+        .grid {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+        .status {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1><span class="pulse"></span>HTTP Server Live Metrics</h1>
+      <div class="grid">
+        <div class="card">
+          <div class="label">Total Requests</div>
+          <div class="value" id="totalRequests">0</div>
+        </div>
+        <div class="card">
+          <div class="label">Active Connections</div>
+          <div class="value" id="activeConnections">0</div>
+        </div>
+        <div class="card">
+          <div class="label">Bytes Sent</div>
+          <div class="value" id="bytesSent">0</div>
+        </div>
+        <div class="card">
+          <div class="label">Status 200</div>
+          <div class="value" id="status200">0</div>
+        </div>
+      </div>
+
+      <div class="status">
+        <div class="card">
+          <div class="label">Status Distribution</div>
+          <pre id="statusJson">{}</pre>
+        </div>
+        <div class="card">
+          <div class="label">Latency Buckets (ms)</div>
+          <pre id="latencyJson">{}</pre>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      async function refreshMetrics() {
+        try {
+          const response = await fetch('/_metrics', { cache: 'no-store' });
+          if (!response.ok) {
+            return;
+          }
+          const data = await response.json();
+          document.getElementById('totalRequests').textContent = data.total_requests ?? 0;
+          document.getElementById('activeConnections').textContent = data.active_connections ?? 0;
+          document.getElementById('bytesSent').textContent = data.bytes_sent_total ?? 0;
+          document.getElementById('status200').textContent = data.status_counts?.['200'] ?? 0;
+          document.getElementById('statusJson').textContent = JSON.stringify(data.status_counts ?? {}, null, 2);
+          document.getElementById('latencyJson').textContent = JSON.stringify(data.latency_buckets_ms ?? {}, null, 2);
+        } catch (_error) {
+          // Keep polling even on transient fetch failures.
+        }
+      }
+
+      refreshMetrics();
+      setInterval(refreshMetrics, 1000);
+    </script>
+  </body>
+</html>
