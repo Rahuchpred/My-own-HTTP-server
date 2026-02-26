@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import logging
 import os
@@ -2286,6 +2287,17 @@ class HTTPServer:
             return None
         return candidate
 
+    def _codecrafters_accepts_gzip(self, request: HTTPRequest) -> bool:
+        raw_header = request.headers.get("accept-encoding", "")
+        if not raw_header:
+            return False
+
+        for token in raw_header.split(","):
+            encoding = token.strip().split(";", 1)[0].strip().lower()
+            if encoding == "gzip":
+                return True
+        return False
+
     def _dispatch_codecrafters_base(self, request: HTTPRequest) -> HTTPResponse | None:
         if not self.codecrafters_mode:
             return None
@@ -2294,10 +2306,15 @@ class HTTPServer:
             if request.method not in {"GET", "HEAD"}:
                 return None
             echo_payload = request.path.removeprefix("/echo/")
+            body_bytes = echo_payload.encode("utf-8")
+            headers = {"Content-Type": "text/plain"}
+            if self._codecrafters_accepts_gzip(request):
+                body_bytes = gzip.compress(body_bytes, mtime=0)
+                headers["Content-Encoding"] = "gzip"
             response = HTTPResponse(
                 status_code=200,
-                headers={"Content-Type": "text/plain"},
-                body=echo_payload,
+                headers=headers,
+                body=body_bytes,
             )
             if request.method == "HEAD":
                 return self._as_head_response(response)

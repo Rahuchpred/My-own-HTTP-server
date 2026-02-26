@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import socket
 import subprocess
 import sys
@@ -248,3 +249,92 @@ def test_cc_mode_accepts_directory_flag_passthrough_from_your_program(tmp_path: 
     assert result.returncode == 0
     assert "--directory" in result.stdout
     assert "--codecrafters-mode" in result.stdout
+
+
+def test_cc_echo_sets_content_encoding_for_gzip_and_compresses_body() -> None:
+    server, thread = _start_server()
+    try:
+        response = _send_request(
+            server.host,
+            server.port,
+            (
+                b"GET /echo/abc HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Accept-Encoding: gzip\r\n"
+                b"Connection: close\r\n\r\n"
+            ),
+        )
+    finally:
+        _stop_server(server, thread)
+
+    head, headers, body = _split_response(response)
+    assert head.startswith(b"HTTP/1.1 200 OK")
+    assert headers.get(b"content-type") == b"text/plain"
+    assert headers.get(b"content-encoding") == b"gzip"
+    assert headers.get(b"content-length") == str(len(body)).encode("ascii")
+    assert gzip.decompress(body) == b"abc"
+
+
+def test_cc_echo_omits_content_encoding_for_invalid_accept_encoding() -> None:
+    server, thread = _start_server()
+    try:
+        response = _send_request(
+            server.host,
+            server.port,
+            (
+                b"GET /echo/abc HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Accept-Encoding: invalid-encoding\r\n"
+                b"Connection: close\r\n\r\n"
+            ),
+        )
+    finally:
+        _stop_server(server, thread)
+
+    head, headers, body = _split_response(response)
+    assert head.startswith(b"HTTP/1.1 200 OK")
+    assert headers.get(b"content-type") == b"text/plain"
+    assert b"content-encoding" not in headers
+    assert body == b"abc"
+
+
+def test_cc_echo_accepts_multiple_encodings_and_picks_gzip() -> None:
+    server, thread = _start_server()
+    try:
+        response = _send_request(
+            server.host,
+            server.port,
+            (
+                b"GET /echo/abc HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Accept-Encoding: invalid-1, gzip, invalid-2\r\n"
+                b"Connection: close\r\n\r\n"
+            ),
+        )
+    finally:
+        _stop_server(server, thread)
+
+    _head, headers, body = _split_response(response)
+    assert headers.get(b"content-encoding") == b"gzip"
+    assert gzip.decompress(body) == b"abc"
+
+
+def test_cc_echo_multiple_invalid_encodings_do_not_compress() -> None:
+    server, thread = _start_server()
+    try:
+        response = _send_request(
+            server.host,
+            server.port,
+            (
+                b"GET /echo/abc HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Accept-Encoding: invalid-1, invalid-2\r\n"
+                b"Connection: close\r\n\r\n"
+            ),
+        )
+    finally:
+        _stop_server(server, thread)
+
+    _head, headers, body = _split_response(response)
+    assert b"content-encoding" not in headers
+    assert body == b"abc"

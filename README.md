@@ -210,6 +210,7 @@ python3 server.py --codecrafters-mode --directory /tmp
 Notes:
 
 - In compatibility mode, default port is `4221` unless `--port` is explicitly provided.
+- `/echo/{str}` supports `Accept-Encoding: gzip` and returns `Content-Encoding: gzip` when accepted.
 - Existing advanced routes/features remain available outside compatibility mode.
 
 Server CLI options:
@@ -388,4 +389,9 @@ Set `SKIP_PUSH=1` to skip push and keep local-only commits.
 
 For final showcase steps (server start, load profile, dashboard flow), use:
 
-- `docs/demo-runbook.md`
+- `docs/demo-runbook.md` - Technical demo steps
+- `docs/demo-recruiter.md` - 2-minute recruiter script with timing and shareable URL
+
+For Cursor Cloud Agents with Computer Use:
+
+- `docs/cloud-agent-setup.md` - Onboard configuration for demo recording
