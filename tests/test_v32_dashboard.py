@@ -27,6 +27,35 @@ def _stop_server(server: HTTPServer, thread: threading.Thread) -> None:
     thread.join(timeout=2)
 
 
+def _recv_http_response(sock: socket.socket) -> bytes:
+    buffer = bytearray()
+    while b"\r\n\r\n" not in buffer:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buffer.extend(chunk)
+
+    header_end = buffer.find(b"\r\n\r\n")
+    if header_end == -1:
+        return bytes(buffer)
+
+    head = bytes(buffer[:header_end])
+    body = bytes(buffer[header_end + 4 :])
+    headers = {}
+    for line in head.split(b"\r\n")[1:]:
+        key, value = line.split(b":", 1)
+        headers[key.strip().lower()] = value.strip().lower()
+
+    content_length = int(headers.get(b"content-length", b"0"))
+    while len(body) < content_length:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        body += chunk
+
+    return head + b"\r\n\r\n" + body
+
+
 def test_dashboard_static_file_contains_metrics_polling() -> None:
     dashboard = (Path(__file__).resolve().parent.parent / "static" / "dashboard.html").read_text(
         encoding="utf-8"
@@ -47,7 +76,7 @@ def test_dashboard_is_served_by_static_route() -> None:
         )
         with socket.create_connection((server.host, server.port), timeout=2) as sock:
             sock.sendall(payload)
-            response = sock.recv(8192)
+            response = _recv_http_response(sock)
     finally:
         _stop_server(server, thread)
 

@@ -21,7 +21,10 @@ def test_serve_existing_static_file() -> None:
 
     assert response.status_code == 200
     assert response.headers["Content-Type"] == "text/html"
-    assert b"Static file is working" in response.body
+    if response.file_path is not None:
+        assert b"Static file is working" in response.file_path.read_bytes()
+    else:
+        assert b"Static file is working" in response.body
 
 
 
