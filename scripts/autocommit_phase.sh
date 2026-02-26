@@ -143,7 +143,7 @@ esac
 "$py_bin" -m ruff check .
 "${phase_tests[@]}"
 
-if git diff --quiet && git diff --cached --quiet; then
+if git diff --quiet && git diff --cached --quiet && [[ -z "$(git ls-files --others --exclude-standard)" ]]; then
   echo "No changes detected; nothing to commit."
   exit 0
 fi
