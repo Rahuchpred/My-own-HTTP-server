@@ -7,88 +7,181 @@
     <link rel="stylesheet" href="/static/playground.css" />
   </head>
   <body>
-    <main class="container">
-      <header class="hero">
+    <main class="app-shell">
+      <header class="topbar">
         <div>
           <h1>API Playground</h1>
-          <p>Build mocks, send real requests, inspect responses, replay traffic.</p>
+          <p>Backend Operations Console: missions, incidents, causality, verdicts.</p>
         </div>
         <div class="badges">
           <span id="engineBadge" class="badge">engine: -</span>
-          <span id="traceBadge" class="badge">trace: -</span>
+          <span id="authBadge" class="badge">auth: checking</span>
+          <span id="eventsBadge" class="badge">events: connecting</span>
+          <span id="healthBadge" class="badge">health: unknown</span>
+          <span id="cursorBadge" class="badge">cursor: 0</span>
         </div>
       </header>
 
-      <section class="grid">
+      <section class="grid two">
         <article class="panel">
-          <h2>Request Lab</h2>
-          <div class="quick-actions">
-            <button data-action="ping">Ping /</button>
-            <button data-action="create-user-mock">Create User Mock</button>
-            <button data-action="stream">Load /stream</button>
+          <h2>Mission Control</h2>
+          <div class="actions">
+            <button data-mission="signup_chaos">User Signup Under Chaos</button>
+            <button data-mission="checkout_latency">Checkout Latency Investigation</button>
+            <button data-mission="upstream_outage">Upstream Outage Simulation</button>
           </div>
+
+          <h3>Incident Mode</h3>
           <div class="row">
-            <select id="reqMethod">
-              <option>GET</option>
-              <option>POST</option>
-              <option>PUT</option>
-              <option>DELETE</option>
+            <select id="incidentMode">
+              <option value="status_spike_503">503 Spike</option>
+              <option value="fixed_latency">Fixed Latency</option>
+              <option value="body_drop">Body Drop</option>
             </select>
-            <input id="reqPath" type="text" value="/" placeholder="/api/users" />
-            <button id="sendBtn">Send</button>
+            <input id="incidentProbability" type="number" min="0" max="1" step="0.05" value="0.6" />
+            <input id="incidentLatency" type="number" min="0" max="10000" step="50" value="2000" />
+            <button id="startIncidentBtn">Start Fault</button>
+            <button id="stopIncidentBtn" class="muted">Stop Fault</button>
           </div>
-          <label>Headers (JSON object)</label>
-          <textarea id="reqHeaders" rows="4">{}</textarea>
-          <label>Body</label>
-          <textarea id="reqBody" rows="6"></textarea>
+          <pre id="incidentState">incident: inactive</pre>
+
+          <h3>Mission Verdict</h3>
+          <div id="verdictCard" class="verdict neutral">
+            <div class="verdict-title">No mission run yet.</div>
+            <div class="verdict-sub">Run a mission to generate pass/fail conclusion and root cause.</div>
+          </div>
+          <pre id="analysisPanel">analysis: -</pre>
+
+          <h3>Narrative Output</h3>
+          <pre id="narrativePanel">No report yet.</pre>
         </article>
 
         <article class="panel">
-          <h2>Response</h2>
-          <div class="stats" id="respStats">
-            <span>Status: -</span>
-            <span>Latency: -</span>
-            <span>Bytes: -</span>
+          <h2>Live Causality Console</h2>
+          <div class="console-columns">
+            <div>
+              <h3>Timeline</h3>
+              <ul id="timelineList" class="timeline"></ul>
+            </div>
+            <div>
+              <h3>Event Detail</h3>
+              <pre id="eventDetail">Click any timeline item.</pre>
+              <h3>Service Map</h3>
+              <pre id="serviceMap">client -> local-server -> route
+state: idle</pre>
+            </div>
           </div>
-          <label>Headers</label>
-          <pre id="respHeaders">{}</pre>
-          <label>Body</label>
-          <pre id="respBody">Send a request to inspect response.</pre>
+          <h3>Diagnostics</h3>
+          <pre id="diagnosticsPanel">No diagnostics yet.</pre>
         </article>
       </section>
 
-      <section class="grid lower">
+      <section class="grid one">
         <article class="panel">
-          <h2>Mock Manager</h2>
-          <div class="row">
-            <select id="mockMethod">
-              <option>GET</option>
-              <option>POST</option>
-              <option>PUT</option>
-              <option>DELETE</option>
-            </select>
-            <input id="mockPath" type="text" placeholder="/api/users" />
-            <input id="mockStatus" type="number" value="201" min="100" max="599" />
+          <h2>SLO Scoreboard</h2>
+          <div class="kpis">
+            <div class="kpi"><span>Reliability Score</span><strong id="scoreReliability">-</strong></div>
+            <div class="kpi"><span>p50 / p95 / p99 (ms)</span><strong id="scoreLatency">-</strong></div>
+            <div class="kpi"><span>Scenario Pass Rate</span><strong id="scorePassRate">-</strong></div>
+            <div class="kpi"><span>Error Budget Burn</span><strong id="scoreBurn">-</strong></div>
+            <div class="kpi"><span>MTTR Proxy</span><strong id="scoreMttr">-</strong></div>
+            <div class="kpi"><span>Current Incident</span><strong id="scoreIncident">inactive</strong></div>
           </div>
-          <label>Mock JSON Body</label>
-          <textarea id="mockBody" rows="5">{"ok":true}</textarea>
-          <div class="row">
-            <button id="createMockBtn">Create Mock</button>
-            <button id="refreshBtn">Refresh</button>
-          </div>
-          <ul id="mocksList" class="list"></ul>
-        </article>
-
-        <article class="panel">
-          <h2>Request History</h2>
-          <div class="row">
-            <input id="historyFilter" type="text" placeholder="Filter by path" />
-            <button id="filterBtn">Apply</button>
-          </div>
-          <ul id="historyList" class="list"></ul>
+          <pre id="comparisonPanel">before/after comparison will appear here.</pre>
         </article>
       </section>
+
+      <details id="advancedPanel" class="advanced">
+        <summary>Advanced Mode (Raw Request Lab + CRUD)</summary>
+        <section class="grid two advanced-grid">
+          <article class="panel">
+            <h2>Request Lab</h2>
+            <div class="row">
+              <select id="reqMethod">
+                <option>GET</option>
+                <option>POST</option>
+                <option>PUT</option>
+                <option>DELETE</option>
+              </select>
+              <select id="reqTarget">
+                <option value="local">local</option>
+              </select>
+              <input id="reqPath" type="text" value="/" placeholder="/api/users" />
+              <button id="sendBtn">Send</button>
+            </div>
+            <label>Headers (JSON object)</label>
+            <textarea id="reqHeaders" rows="4">{}</textarea>
+            <label>Body</label>
+            <textarea id="reqBody" rows="5"></textarea>
+
+            <h3>Response</h3>
+            <div id="respStats" class="stats"><span>Status:-</span><span>Latency:-</span><span>Bytes:-</span></div>
+            <pre id="respHeaders">{}</pre>
+            <pre id="respBody">Send a request to inspect response.</pre>
+
+            <h3>Manual Scenario Launcher</h3>
+            <div class="row">
+              <select id="scenarioSelect"></select>
+              <input id="scenarioSeed" type="number" placeholder="seed (optional)" />
+              <button id="runScenarioBtn">Run</button>
+            </div>
+            <pre id="scenarioRunResult">No scenario run yet.</pre>
+          </article>
+
+          <article class="panel">
+            <h2>Mock Manager</h2>
+            <div class="row">
+              <select id="mockMethod">
+                <option>GET</option>
+                <option>POST</option>
+                <option>PUT</option>
+                <option>DELETE</option>
+              </select>
+              <input id="mockPath" type="text" placeholder="/api/users" />
+              <input id="mockStatus" type="number" value="201" min="100" max="599" />
+            </div>
+            <label>Mock JSON Body</label>
+            <textarea id="mockBody" rows="4">{"ok":true}</textarea>
+            <div class="row">
+              <button id="createMockBtn">Create / Update Mock</button>
+              <button id="refreshBtn" class="muted">Refresh</button>
+            </div>
+            <ul id="mocksList" class="list"></ul>
+
+            <h3>Targets</h3>
+            <div class="row">
+              <input id="targetName" type="text" placeholder="target name" />
+              <input id="targetBaseUrl" type="text" placeholder="https://example.com" />
+            </div>
+            <div class="row">
+              <input id="targetTimeout" type="number" value="5000" min="100" />
+              <button id="createTargetBtn">Create Target</button>
+              <button id="refreshTargetsBtn" class="muted">Refresh</button>
+            </div>
+            <ul id="targetsList" class="list"></ul>
+
+            <h3>Request History</h3>
+            <div class="row">
+              <input id="historyFilter" type="text" placeholder="Filter by path" />
+              <button id="filterBtn" class="muted">Apply</button>
+            </div>
+            <ul id="historyList" class="list"></ul>
+          </article>
+        </section>
+      </details>
     </main>
+
+    <div id="tokenModal" class="modal hidden">
+      <div class="modal-card">
+        <h2>Demo Token Required</h2>
+        <p>Protected APIs are locked. Paste Railway demo token once to enable live missions.</p>
+        <input id="tokenInput" type="password" placeholder="Paste DEMO_TOKEN" />
+        <div class="row">
+          <button id="saveTokenBtn">Save Token</button>
+          <button id="clearTokenBtn" class="muted">Clear Token</button>
+        </div>
+      </div>
+    </div>
 
     <script src="/static/playground.js"></script>
   </body>
