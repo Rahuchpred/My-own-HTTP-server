@@ -16,12 +16,15 @@ import uuid
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import BinaryIO
 
 from config import (
     DRAIN_TIMEOUT_SECS,
     ENABLE_EXPECT_CONTINUE,
+    ENABLE_PLAYGROUND,
     ENABLE_TLS,
+    HISTORY_LIMIT,
     HOST,
     HTTPS_PORT,
     IDLE_SWEEP_INTERVAL_SECS,
@@ -29,6 +32,8 @@ from config import (
     LOG_FORMAT,
     MAX_ACTIVE_CONNECTIONS,
     MAX_KEEPALIVE_REQUESTS,
+    MAX_MOCK_BODY_BYTES,
+    MAX_MOCK_ROUTES,
     PORT,
     REDIRECT_HTTP_TO_HTTPS,
     REQUEST_QUEUE_SIZE,
@@ -36,13 +41,17 @@ from config import (
     SERVER_ENGINE,
     SHUTDOWN_POLL_INTERVAL_SECS,
     SOCKET_TIMEOUT_SECS,
+    STATE_FILE,
     TLS_CERT_FILE,
     TLS_KEY_FILE,
     WORKER_COUNT,
     WRITE_CHUNK_SIZE,
 )
+from dynamic_mock_dispatch import response_from_mock
 from handlers.example_handlers import home, serve_static, stream_demo, submit
 from metrics import MetricsRegistry
+from playground_api import PlaygroundAPI
+from playground_store import PlaygroundStore
 from request import KNOWN_METHODS, HTTPRequest, HTTPRequestParseError
 from response import REASON_PHRASES, HTTPResponse, iter_chunked_encoded, prepare_response
 from router import Router
@@ -78,6 +87,7 @@ class OutboundResponse:
     trace_id: str
     close_after: bool
     metrics_started: bool
+    replay_input: dict[str, object] | None = None
     pending_chunks: deque[memoryview] = field(default_factory=deque)
     stream_iter: Iterator[bytes] | None = None
     file_obj: BinaryIO | None = None
@@ -101,6 +111,7 @@ class OutboundResponse:
         trace_id: str,
         close_after: bool,
         metrics_started: bool,
+        replay_input: dict[str, object] | None = None,
     ) -> "OutboundResponse":
         prepared = prepare_response(response)
         outbound = cls(
@@ -116,6 +127,7 @@ class OutboundResponse:
             trace_id=trace_id,
             close_after=close_after,
             metrics_started=metrics_started,
+            replay_input=replay_input,
         )
         outbound.pending_chunks.append(memoryview(prepared.head))
         if prepared.body is not None and prepared.body:
@@ -177,6 +189,11 @@ class HTTPServer:
         redirect_http_to_https: bool = REDIRECT_HTTP_TO_HTTPS,
         drain_timeout_secs: float = DRAIN_TIMEOUT_SECS,
         log_format: str = LOG_FORMAT,
+        enable_playground: bool = ENABLE_PLAYGROUND,
+        state_file: str = STATE_FILE,
+        history_limit: int = HISTORY_LIMIT,
+        max_mock_body_bytes: int = MAX_MOCK_BODY_BYTES,
+        max_mock_routes: int = MAX_MOCK_ROUTES,
     ) -> None:
         self.host = host
         self.port = port
@@ -190,6 +207,11 @@ class HTTPServer:
         self.keepalive_timeout_secs = keepalive_timeout_secs
         self.drain_timeout_secs = drain_timeout_secs
         self.log_format = log_format
+        self.enable_playground = enable_playground
+        self.state_file = state_file
+        self.history_limit = history_limit
+        self.max_mock_body_bytes = max_mock_body_bytes
+        self.max_mock_routes = max_mock_routes
 
         self.tls_config = TLSConfig(
             enabled=enable_tls,
@@ -213,6 +235,24 @@ class HTTPServer:
         self._drain_elapsed_ms = 0.0
         self._state_lock = threading.Lock()
         self.metrics = MetricsRegistry()
+        self.playground_store: PlaygroundStore | None = None
+        self.playground_api: PlaygroundAPI | None = None
+        if self.enable_playground:
+            self.playground_store = PlaygroundStore(
+                state_file=self.state_file,
+                history_limit=self.history_limit,
+                max_mock_routes=self.max_mock_routes,
+            )
+            self.playground_api = PlaygroundAPI(
+                store=self.playground_store,
+                max_mock_body_bytes=self.max_mock_body_bytes,
+                dispatch_request=self._dispatch_internal_request,
+            )
+            snapshot = self.playground_store.snapshot()
+            self.metrics.set_playground_counts(
+                mock_count=len(snapshot.get("mocks", [])),
+                history_count=len(snapshot.get("history", [])),
+            )
 
     def _build_default_router(self) -> Router:
         router = Router()
@@ -590,6 +630,16 @@ class HTTPServer:
     def _new_trace_id(self) -> str:
         return uuid.uuid4().hex[:16]
 
+    def _build_replay_input(self, request: HTTPRequest) -> dict[str, object]:
+        return {
+            "method": request.method,
+            "path": request.path,
+            "raw_target": request.raw_target,
+            "http_version": request.http_version,
+            "headers": dict(request.headers),
+            "body": request.body.decode("utf-8", errors="replace"),
+        }
+
     def _handle_client(self, client_socket: socket.socket, address: tuple[str, int]) -> None:
         with client_socket:
             self.metrics.connection_opened()
@@ -774,6 +824,7 @@ class HTTPServer:
                             route_key=f"{request.method} {request.path}",
                             trace_id=trace_id,
                             shutdown_phase="draining",
+                            replay_input=self._build_replay_input(request),
                         )
                         return
                     self.metrics.request_started(connection_reused=connection_reused)
@@ -816,6 +867,7 @@ class HTTPServer:
                         request_id=request_count,
                         route_key=f"{request.method} {request.path}",
                         trace_id=trace_id,
+                        replay_input=self._build_replay_input(request),
                     )
                     if should_close:
                         return
@@ -1019,6 +1071,7 @@ class HTTPServer:
                     trace_id=trace_id,
                     close_after=True,
                     metrics_started=False,
+                    replay_input=self._build_replay_input(request),
                 )
                 state.closing = True
                 break
@@ -1055,6 +1108,7 @@ class HTTPServer:
                 trace_id=trace_id,
                 close_after=should_close,
                 metrics_started=True,
+                replay_input=self._build_replay_input(request),
             )
             if should_close:
                 state.closing = True
@@ -1099,6 +1153,7 @@ class HTTPServer:
         trace_id: str | None = None,
         close_after: bool,
         metrics_started: bool,
+        replay_input: dict[str, object] | None = None,
     ) -> None:
         if close_after:
             response.headers.setdefault("Connection", "close")
@@ -1115,6 +1170,7 @@ class HTTPServer:
             trace_id=trace_id or self._new_trace_id(),
             close_after=close_after,
             metrics_started=metrics_started,
+            replay_input=replay_input,
         )
         state.queued_responses.append(outbound)
 
@@ -1183,7 +1239,10 @@ class HTTPServer:
                 continue
 
             if outbound.file_obj is not None and outbound.file_remaining > 0:
-                if hasattr(os, "sendfile"):
+                can_use_sendfile = hasattr(os, "sendfile") and not isinstance(
+                    state.sock, ssl.SSLSocket
+                )
+                if can_use_sendfile:
                     try:
                         sent = os.sendfile(
                             state.sock.fileno(),
@@ -1254,6 +1313,7 @@ class HTTPServer:
             request_id=outbound.request_id,
             route_key=outbound.route_key,
             trace_id=outbound.trace_id,
+            replay_input=outbound.replay_input,
         )
 
         if outbound.close_after:
@@ -1339,17 +1399,38 @@ class HTTPServer:
         self._selector_connections.pop(fileno, None)
         self.metrics.connection_closed()
 
+    def _dispatch_internal_request(self, request: HTTPRequest) -> HTTPResponse:
+        response = self._dispatch(request)
+        if response.headers.get("X-Request-ID") is None:
+            response.headers["X-Request-ID"] = self._new_trace_id()
+        return response
+
+    def _serve_playground_page(self, *, as_head: bool) -> HTTPResponse:
+        playground_path = Path("static") / "playground.html"
+        if not playground_path.exists() or not playground_path.is_file():
+            return HTTPResponse(status_code=404, body="Not Found")
+        response = HTTPResponse(
+            status_code=200,
+            headers={"Content-Type": "text/html; charset=utf-8"},
+            file_path=playground_path,
+        )
+        if as_head:
+            return self._as_head_response(response)
+        return response
+
+    def _is_playground_admin_path(self, path: str) -> bool:
+        return (
+            path == "/api/playground/state"
+            or path == "/api/mocks"
+            or path == "/api/history"
+            or path == "/api/playground/request"
+            or path.startswith("/api/mocks/")
+            or path.startswith("/api/replay/")
+        )
+
     def _dispatch(self, request: HTTPRequest) -> HTTPResponse:
         if request.method not in KNOWN_METHODS:
             return HTTPResponse(status_code=501, body="Not Implemented")
-
-        allowed_methods = {"GET", "HEAD", "POST"}
-        if request.method not in allowed_methods:
-            return HTTPResponse(
-                status_code=405,
-                headers={"Allow": "GET, HEAD, POST"},
-                body="Method Not Allowed",
-            )
 
         if request.path == "/_metrics":
             if request.method not in {"GET", "HEAD"}:
@@ -1358,7 +1439,9 @@ class HTTPServer:
                     headers={"Allow": "GET, HEAD"},
                     body="Method Not Allowed",
                 )
-            snapshot = json.dumps(self.metrics.snapshot(), sort_keys=True)
+            metrics_snapshot = self.metrics.snapshot()
+            metrics_snapshot["engine"] = self.engine
+            snapshot = json.dumps(metrics_snapshot, sort_keys=True)
             metrics_response = HTTPResponse(
                 status_code=200,
                 headers={"Content-Type": "application/json"},
@@ -1367,6 +1450,38 @@ class HTTPServer:
             if request.method == "HEAD":
                 return self._as_head_response(metrics_response)
             return metrics_response
+
+        if request.path == "/playground":
+            if not self.enable_playground:
+                return HTTPResponse(status_code=404, body="Not Found")
+            if request.method not in {"GET", "HEAD"}:
+                return HTTPResponse(
+                    status_code=405,
+                    headers={"Allow": "GET, HEAD"},
+                    body="Method Not Allowed",
+                )
+            return self._serve_playground_page(as_head=request.method == "HEAD")
+
+        if self._is_playground_admin_path(request.path):
+            if not self.enable_playground or self.playground_api is None:
+                return HTTPResponse(status_code=404, body="Not Found")
+            response = self.playground_api.handle(request)
+            if response.status_code >= 400:
+                self.metrics.record_playground_admin_error()
+            if request.path.startswith("/api/replay/") and request.method == "POST":
+                self.metrics.record_playground_replay()
+            snapshot = (
+                self.playground_store.snapshot()
+                if self.playground_store is not None
+                else {"mocks": [], "history": []}
+            )
+            self.metrics.set_playground_counts(
+                mock_count=len(snapshot.get("mocks", [])),
+                history_count=len(snapshot.get("history", [])),
+            )
+            if request.method == "HEAD":
+                return self._as_head_response(response)
+            return response
 
         if request.path.startswith("/static/"):
             if request.method not in {"GET", "HEAD"}:
@@ -1379,6 +1494,23 @@ class HTTPServer:
                 get_request = self._request_with_method(request, method="GET")
                 return self._as_head_response(serve_static(get_request))
             return serve_static(request)
+
+        if self.enable_playground and self.playground_store is not None:
+            mock_method = "GET" if request.method == "HEAD" else request.method
+            mock = self.playground_store.find_mock(method=mock_method, path=request.path)
+            if mock is not None:
+                response = response_from_mock(request, mock)
+                if request.method == "HEAD":
+                    return self._as_head_response(response)
+                return response
+
+        allowed_methods = {"GET", "HEAD", "POST"}
+        if request.method not in allowed_methods:
+            return HTTPResponse(
+                status_code=405,
+                headers={"Allow": "GET, HEAD, POST"},
+                body="Method Not Allowed",
+            )
 
         if request.method == "HEAD":
             handler = self.router.resolve("GET", request.path)
@@ -1420,6 +1552,7 @@ class HTTPServer:
         route_key: str | None = None,
         trace_id: str | None = None,
         shutdown_phase: str | None = None,
+        replay_input: dict[str, object] | None = None,
     ) -> None:
         duration_ms = (time.perf_counter() - started_at) * 1000
         self.metrics.record_request(
@@ -1452,6 +1585,47 @@ class HTTPServer:
             "shutdown_phase": shutdown_phase or self._lifecycle_state,
             "drain_elapsed_ms": drain_elapsed_ms,
         }
+        if path.startswith("/api/mocks") and method == "POST":
+            event["playground_action"] = "mock_create"
+        elif path.startswith("/api/mocks/") and method == "PUT":
+            event["playground_action"] = "mock_update"
+            event["mock_id"] = path.removeprefix("/api/mocks/")
+        elif path.startswith("/api/mocks/") and method == "DELETE":
+            event["playground_action"] = "mock_delete"
+            event["mock_id"] = path.removeprefix("/api/mocks/")
+        elif path.startswith("/api/replay/") and method == "POST":
+            event["playground_action"] = "replay"
+            event["replayed_request_id"] = path.removeprefix("/api/replay/")
+
+        should_capture_history = (
+            path not in {"/_metrics", "/api/playground/state"}
+            and not path.startswith("/static/")
+        )
+        if (
+            self.enable_playground
+            and self.playground_store is not None
+            and trace_id
+            and should_capture_history
+        ):
+            history_record = {
+                "request_id": trace_id,
+                "trace_id": trace_id,
+                "method": method,
+                "path": path,
+                "status": response.status_code,
+                "latency_ms": round(duration_ms, 3),
+                "bytes_in": bytes_in,
+                "bytes_out": payload_size,
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "replay_input": replay_input or {},
+            }
+            self.playground_store.add_history(history_record)
+            snapshot = self.playground_store.snapshot()
+            self.metrics.set_playground_counts(
+                mock_count=len(snapshot.get("mocks", [])),
+                history_count=len(snapshot.get("history", [])),
+            )
+
         if self.log_format == "json":
             logger.info(json.dumps(event, sort_keys=True))
             return
@@ -1544,6 +1718,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-connections", type=int, default=MAX_ACTIVE_CONNECTIONS)
     parser.add_argument("--keepalive-timeout", type=int, default=KEEPALIVE_TIMEOUT_SECS)
     parser.add_argument("--log-format", choices=["plain", "json"], default=LOG_FORMAT)
+    parser.add_argument(
+        "--enable-playground",
+        action=argparse.BooleanOptionalAction,
+        default=ENABLE_PLAYGROUND,
+    )
+    parser.add_argument("--state-file", default=STATE_FILE)
+    parser.add_argument("--history-limit", type=int, default=HISTORY_LIMIT)
+    parser.add_argument("--max-mock-body-bytes", type=int, default=MAX_MOCK_BODY_BYTES)
     return parser.parse_args()
 
 
@@ -1573,6 +1755,10 @@ if __name__ == "__main__":
         redirect_http_to_https=args.redirect_http,
         drain_timeout_secs=args.drain_timeout,
         log_format=args.log_format,
+        enable_playground=args.enable_playground,
+        state_file=args.state_file,
+        history_limit=args.history_limit,
+        max_mock_body_bytes=args.max_mock_body_bytes,
     )
     _install_signal_handlers(server)
     try:

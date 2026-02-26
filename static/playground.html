@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>API Playground</title>
+    <link rel="stylesheet" href="/static/playground.css" />
+  </head>
+  <body>
+    <main class="container">
+      <header class="hero">
+        <div>
+          <h1>API Playground</h1>
+          <p>Build mocks, send real requests, inspect responses, replay traffic.</p>
+        </div>
+        <div class="badges">
+          <span id="engineBadge" class="badge">engine: -</span>
+          <span id="traceBadge" class="badge">trace: -</span>
+        </div>
+      </header>
+
+      <section class="grid">
+        <article class="panel">
+          <h2>Request Lab</h2>
+          <div class="quick-actions">
+            <button data-action="ping">Ping /</button>
+            <button data-action="create-user-mock">Create User Mock</button>
+            <button data-action="stream">Load /stream</button>
+          </div>
+          <div class="row">
+            <select id="reqMethod">
+              <option>GET</option>
+              <option>POST</option>
+              <option>PUT</option>
+              <option>DELETE</option>
+            </select>
+            <input id="reqPath" type="text" value="/" placeholder="/api/users" />
+            <button id="sendBtn">Send</button>
+          </div>
+          <label>Headers (JSON object)</label>
+          <textarea id="reqHeaders" rows="4">{}</textarea>
+          <label>Body</label>
+          <textarea id="reqBody" rows="6"></textarea>
+        </article>
+
+        <article class="panel">
+          <h2>Response</h2>
+          <div class="stats" id="respStats">
+            <span>Status: -</span>
+            <span>Latency: -</span>
+            <span>Bytes: -</span>
+          </div>
+          <label>Headers</label>
+          <pre id="respHeaders">{}</pre>
+          <label>Body</label>
+          <pre id="respBody">Send a request to inspect response.</pre>
+        </article>
+      </section>
+
+      <section class="grid lower">
+        <article class="panel">
+          <h2>Mock Manager</h2>
+          <div class="row">
+            <select id="mockMethod">
+              <option>GET</option>
+              <option>POST</option>
+              <option>PUT</option>
+              <option>DELETE</option>
+            </select>
+            <input id="mockPath" type="text" placeholder="/api/users" />
+            <input id="mockStatus" type="number" value="201" min="100" max="599" />
+          </div>
+          <label>Mock JSON Body</label>
+          <textarea id="mockBody" rows="5">{"ok":true}</textarea>
+          <div class="row">
+            <button id="createMockBtn">Create Mock</button>
+            <button id="refreshBtn">Refresh</button>
+          </div>
+          <ul id="mocksList" class="list"></ul>
+        </article>
+
+        <article class="panel">
+          <h2>Request History</h2>
+          <div class="row">
+            <input id="historyFilter" type="text" placeholder="Filter by path" />
+            <button id="filterBtn">Apply</button>
+          </div>
+          <ul id="historyList" class="list"></ul>
+        </article>
+      </section>
+    </main>
+
+    <script src="/static/playground.js"></script>
+  </body>
+</html>

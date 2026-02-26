@@ -29,6 +29,10 @@ class MetricsRegistry:
         self._drain_state = "running"
         self._drain_inflight_remaining = 0
         self._drain_elapsed_ms = 0.0
+        self._playground_mock_count = 0
+        self._playground_history_count = 0
+        self._playground_replay_total = 0
+        self._playground_admin_errors_total = 0
 
     def connection_opened(self) -> None:
         with self._lock:
@@ -103,6 +107,19 @@ class MetricsRegistry:
             self._drain_inflight_remaining = inflight_remaining
             self._drain_elapsed_ms = round(elapsed_ms, 3)
 
+    def set_playground_counts(self, *, mock_count: int, history_count: int) -> None:
+        with self._lock:
+            self._playground_mock_count = max(0, mock_count)
+            self._playground_history_count = max(0, history_count)
+
+    def record_playground_replay(self) -> None:
+        with self._lock:
+            self._playground_replay_total += 1
+
+    def record_playground_admin_error(self) -> None:
+        with self._lock:
+            self._playground_admin_errors_total += 1
+
     def snapshot(self) -> dict[str, object]:
         with self._lock:
             latency_by_route = {
@@ -132,6 +149,10 @@ class MetricsRegistry:
                 "drain_state": self._drain_state,
                 "drain_inflight_remaining": self._drain_inflight_remaining,
                 "drain_elapsed_ms": self._drain_elapsed_ms,
+                "playground_mock_count": self._playground_mock_count,
+                "playground_history_count": self._playground_history_count,
+                "playground_replay_total": self._playground_replay_total,
+                "playground_admin_errors_total": self._playground_admin_errors_total,
             }
 
     def _bucket_label(self, duration_ms: float) -> str:
