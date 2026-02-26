@@ -88,6 +88,10 @@ TCP accept ----> | Engine Selector     | ----> threadpool engine
 - `GET /` -> Hello world text response
 - `GET /stream` -> chunked demo response
 - `POST /submit` -> echoes submitted body
+- `GET /echo/{str}` -> echo endpoint (compatibility mode)
+- `GET /user-agent` -> echoes `User-Agent` header (compatibility mode)
+- `GET /files/{filename}` -> serves file bytes from `--directory` (compatibility mode)
+- `POST /files/{filename}` -> writes request body to file in `--directory` (compatibility mode)
 - `GET /playground` -> API Playground UI
 - `GET /static/*` -> serve static files
 - `GET /_metrics` -> JSON metrics snapshot
@@ -183,10 +187,37 @@ TLS mode with redirect:
 python3 server.py --enable-tls --cert-file certs/dev-cert.pem --key-file certs/dev-key.pem --https-port 8443 --redirect-http
 ```
 
+### CodeCrafters Compatibility Mode
+
+Use compatibility mode to run with the CodeCrafters-style base behavior (`/echo/*`, `/user-agent`, `/files/*`):
+
+```bash
+./your_program.sh
+```
+
+With a files directory for `/files/{filename}` routes:
+
+```bash
+./your_program.sh --directory /tmp
+```
+
+You can also enable it directly:
+
+```bash
+python3 server.py --codecrafters-mode --directory /tmp
+```
+
+Notes:
+
+- In compatibility mode, default port is `4221` unless `--port` is explicitly provided.
+- Existing advanced routes/features remain available outside compatibility mode.
+
 Server CLI options:
 
 - `--host` (default `127.0.0.1`)
-- `--port` (default `8080`)
+- `--port` (default `8080`, or `4221` with `--codecrafters-mode`)
+- `--codecrafters-mode`
+- `--directory` (used by `/files/{filename}` in compatibility mode)
 - `--engine` (`threadpool` or `selectors`)
 - `--max-connections`
 - `--keepalive-timeout`

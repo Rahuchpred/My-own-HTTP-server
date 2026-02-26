@@ -252,6 +252,8 @@ class HTTPServer:
         demo_token: str = DEMO_TOKEN,
         require_demo_token: bool = REQUIRE_DEMO_TOKEN,
         public_base_url: str = PUBLIC_BASE_URL,
+        codecrafters_mode: bool = False,
+        files_directory: str | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -286,6 +288,10 @@ class HTTPServer:
         self.demo_token = demo_token
         self.require_demo_token = require_demo_token
         self.public_base_url = public_base_url
+        self.codecrafters_mode = codecrafters_mode
+        self.files_directory = (
+            Path(files_directory).resolve() if files_directory is not None else None
+        )
         self.enable_incident_mode = ENABLE_INCIDENT_MODE
 
         self.tls_config = TLSConfig(
@@ -2257,11 +2263,101 @@ class HTTPServer:
             or path.startswith("/api/incidents/")
         )
 
+    def _codecrafters_file_path(self, request_path: str) -> Path | None:
+        if self.files_directory is None:
+            return None
+        if not self.files_directory.exists() or not self.files_directory.is_dir():
+            return None
+        if not request_path.startswith("/files/"):
+            return None
+
+        filename = request_path.removeprefix("/files/")
+        if not filename:
+            return None
+        if "/" in filename or "\\" in filename:
+            return None
+        if filename in {".", ".."}:
+            return None
+
+        candidate = (self.files_directory / filename).resolve()
+        try:
+            candidate.relative_to(self.files_directory)
+        except ValueError:
+            return None
+        return candidate
+
+    def _dispatch_codecrafters_base(self, request: HTTPRequest) -> HTTPResponse | None:
+        if not self.codecrafters_mode:
+            return None
+
+        if request.path.startswith("/echo/"):
+            if request.method not in {"GET", "HEAD"}:
+                return None
+            echo_payload = request.path.removeprefix("/echo/")
+            response = HTTPResponse(
+                status_code=200,
+                headers={"Content-Type": "text/plain"},
+                body=echo_payload,
+            )
+            if request.method == "HEAD":
+                return self._as_head_response(response)
+            return response
+
+        if request.path == "/user-agent":
+            if request.method not in {"GET", "HEAD"}:
+                return None
+            user_agent = request.headers.get("user-agent", "")
+            response = HTTPResponse(
+                status_code=200,
+                headers={"Content-Type": "text/plain"},
+                body=user_agent,
+            )
+            if request.method == "HEAD":
+                return self._as_head_response(response)
+            return response
+
+        if request.path.startswith("/files/"):
+            if request.method in {"GET", "HEAD"}:
+                file_path = self._codecrafters_file_path(request.path)
+                if file_path is None or not file_path.exists() or not file_path.is_file():
+                    not_found = HTTPResponse(status_code=404, body="Not Found")
+                    if request.method == "HEAD":
+                        return self._as_head_response(not_found)
+                    return not_found
+
+                response = HTTPResponse(
+                    status_code=200,
+                    headers={"Content-Type": "application/octet-stream"},
+                    file_path=file_path,
+                )
+                if request.method == "HEAD":
+                    return self._as_head_response(response)
+                return response
+
+            if request.method == "POST":
+                file_path = self._codecrafters_file_path(request.path)
+                if file_path is None:
+                    return HTTPResponse(status_code=404, body="Not Found")
+                if file_path.exists() and not file_path.is_file():
+                    return HTTPResponse(status_code=404, body="Not Found")
+                try:
+                    file_path.write_bytes(request.body)
+                except OSError:
+                    self.metrics.record_error_class("dispatch")
+                    logger.exception("Failed to write file in codecrafters mode")
+                    return HTTPResponse(status_code=500, body="Internal Server Error")
+                return HTTPResponse(status_code=201, reason_phrase="Created", body=b"")
+
+        return None
+
     def _dispatch(self, request: HTTPRequest) -> HTTPResponse:
         if request.method not in KNOWN_METHODS:
             return HTTPResponse(status_code=501, body="Not Implemented")
         if self._is_protected_path(request.path) and not self._is_authorized(request):
             return self._unauthorized_response()
+        compatibility_response = self._dispatch_codecrafters_base(request)
+        if compatibility_response is not None:
+            return compatibility_response
 
         if request.path == "/_metrics":
             if request.method not in {"GET", "HEAD"}:
@@ -2635,7 +2731,9 @@ class HTTPServer:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run custom HTTP server")
     parser.add_argument("--host", default=HOST)
-    parser.add_argument("--port", type=int, default=PORT)
+    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--codecrafters-mode", action="store_true", default=False)
+    parser.add_argument("--directory", default=None)
     parser.add_argument("--enable-tls", action="store_true", default=ENABLE_TLS)
     parser.add_argument("--cert-file", default=TLS_CERT_FILE)
     parser.add_argument("--key-file", default=TLS_KEY_FILE)
@@ -2699,7 +2797,10 @@ def _parse_args() -> argparse.Namespace:
         default=REQUIRE_DEMO_TOKEN,
     )
     parser.add_argument("--public-base-url", default=PUBLIC_BASE_URL)
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.port is None:
+        args.port = 4221 if args.codecrafters_mode else PORT
+    return args
 
 
 def _install_signal_handlers(server: HTTPServer) -> None:
@@ -2749,6 +2850,8 @@ if __name__ == "__main__":
         demo_token=args.demo_token,
         require_demo_token=args.require_demo_token,
         public_base_url=args.public_base_url,
+        codecrafters_mode=args.codecrafters_mode,
+        files_directory=args.directory,
     )
     _install_signal_handlers(server)
     try:
