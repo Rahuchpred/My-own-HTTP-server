@@ -32,3 +32,35 @@ jobs:
 
       - name: Run tests
         run: pytest -q
+
+  integration-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [threadpool, selectors]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Verify OpenSSL available
+        run: openssl version
+
+      - name: Run TLS and lifecycle suites
+        run: |
+          if [ "${{ matrix.engine }}" = "threadpool" ]; then
+            pytest -q tests/test_v40_tls.py tests/test_v41_graceful_shutdown.py tests/test_v42_observability.py
+          else
+            pytest -q tests/test_v37_selectors_engine.py tests/test_v38_expect_continue.py tests/test_v40_tls.py tests/test_v42_observability.py
+          fi
