@@ -1,0 +1,398 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "CustomHTTPServer API",
+    "version": "1.0.0",
+    "description": "Raw-socket Python HTTP server with playground, chaos controls, live events, and compatibility routes."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8080"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "BearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": { "type": "string" },
+              "message": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  },
+  "paths": {
+    "/": {
+      "get": {
+        "summary": "Home endpoint",
+        "responses": {
+          "200": {
+            "description": "Hello World",
+            "content": {
+              "text/plain": {
+                "example": "Hello World"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/echo/{str}": {
+      "get": {
+        "summary": "CodeCrafters echo route",
+        "parameters": [
+          { "name": "str", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Echo text",
+            "content": {
+              "text/plain": { "example": "codecrafters" }
+            }
+          }
+        }
+      }
+    },
+    "/user-agent": {
+      "get": {
+        "summary": "Echo user agent",
+        "responses": {
+          "200": {
+            "description": "User-Agent value",
+            "content": {
+              "text/plain": { "example": "curl/8.5.0" }
+            }
+          }
+        }
+      }
+    },
+    "/files/{filename}": {
+      "get": {
+        "summary": "Read file bytes from compatibility directory",
+        "parameters": [
+          { "name": "filename", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Binary file",
+            "content": {
+              "application/octet-stream": {}
+            }
+          },
+          "404": { "description": "Not found" }
+        }
+      },
+      "post": {
+        "summary": "Write file bytes to compatibility directory",
+        "parameters": [
+          { "name": "filename", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {}
+          }
+        },
+        "responses": {
+          "201": { "description": "Created" },
+          "404": { "description": "Directory or file route unavailable" }
+        }
+      }
+    },
+    "/_metrics": {
+      "get": {
+        "summary": "Realtime in-memory metrics snapshot",
+        "responses": {
+          "200": {
+            "description": "Metrics payload",
+            "content": {
+              "application/json": {
+                "example": {
+                  "total_requests": 42,
+                  "latency_p99_ms": 501.2,
+                  "metrics_backend": "sqlite"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/metrics/trends": {
+      "get": {
+        "summary": "Persistent trend points",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          { "name": "window", "in": "query", "schema": { "type": "string", "example": "24h" } },
+          { "name": "route", "in": "query", "schema": { "type": "string", "example": "__all__" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "Trend rows",
+            "content": {
+              "application/json": {
+                "example": {
+                  "window": "24h",
+                  "route": "__all__",
+                  "backend": "sqlite",
+                  "summary": {
+                    "request_count": 700,
+                    "status_4xx": 12,
+                    "status_5xx": 5,
+                    "p50": 25,
+                    "p95": 500,
+                    "p99": 2000,
+                    "error_rate": 2.42
+                  },
+                  "points": []
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/events/live-mode": {
+      "get": {
+        "summary": "Live SSE readiness and fallback guidance",
+        "security": [{ "BearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Live mode status",
+            "content": {
+              "application/json": {
+                "example": {
+                  "available": false,
+                  "engine": "threadpool",
+                  "required_engine": "selectors",
+                  "reason": "use_selectors_engine",
+                  "fallback": { "mode": "snapshot_polling", "refresh_ms": 1000 },
+                  "actions": { "retry": true, "recommended_command": "python3 server.py --engine selectors" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/events/snapshot": {
+      "get": {
+        "summary": "Pull events since cursor",
+        "security": [{ "BearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Events list",
+            "content": {
+              "application/json": {
+                "example": {
+                  "events": [],
+                  "latest_id": 42,
+                  "oldest_id": 1,
+                  "overflowed": false,
+                  "refresh_ms": 100
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/events/stream": {
+      "get": {
+        "summary": "SSE stream",
+        "security": [{ "BearerAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "text/event-stream"
+          },
+          "409": {
+            "description": "Selectors engine required",
+            "content": {
+              "application/json": {
+                "example": {
+                  "error": { "code": "use_selectors_engine", "message": "live events require selectors engine" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/auth/login": {
+      "post": {
+        "summary": "Login with local user credentials",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "example": {
+                "username": "operator",
+                "password": "operator123"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Session token",
+            "content": {
+              "application/json": {
+                "example": {
+                  "session": {
+                    "token": "<bearer-token>",
+                    "username": "operator",
+                    "role": "operator",
+                    "expires_at": 1772177658
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          }
+        }
+      }
+    },
+    "/api/auth/me": {
+      "get": {
+        "summary": "Current identity and role",
+        "security": [{ "BearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Auth context" },
+          "401": { "description": "Unauthorized" }
+        }
+      }
+    },
+    "/api/auth/logout": {
+      "post": {
+        "summary": "Invalidate current session",
+        "security": [{ "BearerAuth": [] }],
+        "responses": {
+          "200": { "description": "Logged out" },
+          "401": { "description": "Unauthorized" }
+        }
+      }
+    },
+    "/api/mocks": {
+      "get": { "summary": "List mocks", "security": [{ "BearerAuth": [] }], "responses": { "200": { "description": "OK" } } },
+      "post": {
+        "summary": "Create mock",
+        "security": [{ "BearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "example": {
+                "method": "POST",
+                "path_pattern": "/api/users",
+                "status": 201,
+                "headers": { "X-Mock-Server": "manual" },
+                "body": "{\"ok\":true}",
+                "content_type": "application/json"
+              }
+            }
+          }
+        },
+        "responses": { "201": { "description": "Created" }, "403": { "description": "Forbidden" } }
+      }
+    },
+    "/api/scenarios": {
+      "get": { "summary": "List scenarios", "security": [{ "BearerAuth": [] }], "responses": { "200": { "description": "OK" } } },
+      "post": {
+        "summary": "Create scenario",
+        "security": [{ "BearerAuth": [] }],
+        "responses": { "201": { "description": "Created" }, "403": { "description": "Forbidden" } }
+      }
+    },
+    "/api/scenarios/{id}/run": {
+      "post": {
+        "summary": "Execute scenario",
+        "security": [{ "BearerAuth": [] }],
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Run result" }, "403": { "description": "Forbidden" } }
+      }
+    },
+    "/api/incidents/state": {
+      "get": {
+        "summary": "Incident state",
+        "security": [{ "BearerAuth": [] }],
+        "responses": { "200": { "description": "Current incident" } }
+      }
+    },
+    "/api/incidents/start": {
+      "post": {
+        "summary": "Start incident injection",
+        "security": [{ "BearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "example": { "mode": "status_spike_503", "probability": 0.25, "latency_ms": 0, "seed": 1337 }
+            }
+          }
+        },
+        "responses": { "200": { "description": "Started" }, "403": { "description": "Forbidden" } }
+      }
+    },
+    "/api/incidents/stop": {
+      "post": {
+        "summary": "Stop incident injection",
+        "security": [{ "BearerAuth": [] }],
+        "responses": { "200": { "description": "Stopped" }, "403": { "description": "Forbidden" } }
+      }
+    },
+    "/api/targets": {
+      "get": { "summary": "List targets", "security": [{ "BearerAuth": [] }], "responses": { "200": { "description": "OK" } } },
+      "post": { "summary": "Create target", "security": [{ "BearerAuth": [] }], "responses": { "201": { "description": "Created" }, "403": { "description": "Forbidden" } } }
+    },
+    "/api/proxy/request": {
+      "post": {
+        "summary": "Proxy request through named target",
+        "security": [{ "BearerAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "example": {
+                "target_id": "fixture",
+                "method": "GET",
+                "path": "/health",
+                "headers": {},
+                "body": ""
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Proxied response",
+            "content": {
+              "application/json": {
+                "example": {
+                  "request": { "target_id": "fixture", "method": "GET", "path": "/health" },
+                  "response": { "status": 200, "headers": {}, "body": "{\"ok\":true}" },
+                  "trace_id": "abc123"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

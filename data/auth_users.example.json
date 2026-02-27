@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "users": [
+    {
+      "username": "viewer",
+      "password_hash": "pbkdf2_sha256$180000$bd84f0dfb8290703f5ef08a0dfd5b8ac$45d19c13a7a06b24be9d86158f77637e46bbae676b7f2dd44b4c3b804a521818",
+      "role": "viewer",
+      "enabled": true
+    },
+    {
+      "username": "operator",
+      "password_hash": "pbkdf2_sha256$180000$b0f61b97fe40a662970e7de6dfac0116$de044b995553272ddc5dec2a8dcb4e16aea3977dfadf08eb2d7da5680e694459",
+      "role": "operator",
+      "enabled": true
+    },
+    {
+      "username": "admin",
+      "password_hash": "pbkdf2_sha256$180000$6d47c64299f3294a91f2e3e6db9d6e8d$296b5aea71217ef36bd772f433943509651e447fda2ad67ff89c55c7d218aace",
+      "role": "admin",
+      "enabled": true
+    }
+  ]
+}

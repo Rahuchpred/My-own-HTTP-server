@@ -42,8 +42,12 @@ Custom HTTP/1.1 server implemented from scratch in Python using raw TCP sockets.
   - `GET/POST /api/targets`, `PUT/DELETE /api/targets/{id}`
   - `POST /api/proxy/request`
 - Optional demo token guard for admin/live/proxy APIs
+- Role-based auth sessions (`viewer`, `operator`, `admin`) with local credential seeding
+- Live-event self-healing mode (`SSE -> snapshot fallback`) with readiness endpoint
 - Event-driven playground Control Tower (live requests, scenario timeline, proxy activity)
 - JSON-file state persistence (`data/server_state.json`) for mock routes and request history
+- SQLite-backed persistent trend storage for p50/p95/p99 and error rates
+- OpenAPI contract endpoint (`GET /openapi.json`) with runnable examples
 - Route-level latency summaries (`p50/p95/p99`) and error-class counters
 - Structured access logs with engine, connection id, request id, trace id, shutdown phase, playground actions
 - Load-testing and benchmark tooling (`tools/loadgen.py`, `tools/compare_engines.py`)
@@ -94,8 +98,13 @@ TCP accept ----> | Engine Selector     | ----> threadpool engine
 - `POST /files/{filename}` -> writes request body to file in `--directory` (compatibility mode)
 - `GET /playground` -> API Playground UI
 - `GET /playground-minimal` -> Minimal Playground UI (Inter + Instrument Serif)
+- `GET /openapi.json` -> OpenAPI contract
 - `GET /static/*` -> serve static files
 - `GET /_metrics` -> JSON metrics snapshot
+- `GET /api/metrics/trends` -> persistent trend points for `window` + `route`
+- `POST /api/auth/login` -> create role-backed session token
+- `GET /api/auth/me` -> current role/session principal
+- `POST /api/auth/logout` -> revoke current session token
 - `GET /api/mocks` -> list mock routes
 - `POST /api/mocks` -> create mock route
 - `PUT /api/mocks/{id}` -> update mock route
@@ -113,6 +122,7 @@ TCP accept ----> | Engine Selector     | ----> threadpool engine
 - `GET /api/scenarios/runs/{run_id}` -> fetch one run report
 - `GET /api/events/snapshot` -> pull event batches since cursor
 - `GET /api/events/stream` -> SSE event stream
+- `GET /api/events/live-mode` -> live readiness and fallback guidance
 - `GET /api/targets` -> list proxy targets
 - `POST /api/targets` -> create proxy target
 - `PUT /api/targets/{id}` -> update target
@@ -128,6 +138,9 @@ TCP accept ----> | Engine Selector     | ----> threadpool engine
 - `request.py`: `HTTPRequest` model and strict parser
 - `response.py`: `HTTPResponse` model and serializer/preparer
 - `metrics.py`: in-memory metrics counters and latency buckets
+- `metrics_store.py`: persistent trend storage backends (`memory`, `sqlite`)
+- `auth_store.py`: local user/role credential verification (PBKDF2)
+- `session_store.py`: in-memory bearer session lifecycle + TTL
 - `router.py`: route registry + lookup
 - `handlers/example_handlers.py`: route handlers
 - `utils.py`: static path + MIME helpers
@@ -135,6 +148,7 @@ TCP accept ----> | Engine Selector     | ----> threadpool engine
 - `tools/loadgen.py`: async load generator (keep-alive + pipeline options)
 - `tools/compare_engines.py`: benchmark and gate checker
 - `tests/`: unit + integration + phase validation tests
+- `openapi/openapi.json`: API contract for external testers
 
 ## Requirements
 
@@ -247,6 +261,31 @@ Server CLI options:
 - `--max-targets` (default `50`)
 - `--demo-token`, `--require-demo-token` / `--no-require-demo-token`
 - `--public-base-url`
+- `--metrics-backend` (`memory` or `sqlite`)
+- `--metrics-sqlite-file` (default `data/metrics.sqlite3`)
+- `--metrics-retention-days` (default `30`)
+- `--metrics-flush-interval-secs` (default `10`)
+- `--auth-users-file` (default `data/auth_users.json`)
+- `--session-ttl-minutes` (default `480`)
+
+### Auth Bootstrap (Roles)
+
+Role-based auth activates when either:
+
+- `--require-demo-token` / `DEMO_TOKEN` is set, or
+- `--auth-users-file` exists with at least one user.
+
+Seed file example:
+
+```bash
+cp data/auth_users.example.json data/auth_users.json
+```
+
+Role policy:
+
+- `viewer`: read-only (`events`, `history`, `state`, `trends`, scenario reads)
+- `operator`: viewer + incidents, replay, manual requests, scenario run, proxy request
+- `admin`: operator + CRUD (`mocks`, `scenarios`, `targets`)
 
 ## Tuning Knobs
 
@@ -268,6 +307,8 @@ Defined in `config.py`:
 - `ENABLE_LIVE_EVENTS`, `EVENT_BUFFER_SIZE`, `EVENT_HEARTBEAT_SECS`, `CLI_REFRESH_MS_DEFAULT`
 - `ENABLE_TARGET_PROXY`, `TARGET_STATE_FILE`, `MAX_TARGETS`
 - `DEMO_TOKEN`, `REQUIRE_DEMO_TOKEN`, `PUBLIC_BASE_URL`
+- `METRICS_BACKEND`, `METRICS_SQLITE_FILE`, `METRICS_RETENTION_DAYS`, `METRICS_FLUSH_INTERVAL_SECS`
+- `AUTH_USERS_FILE`, `SESSION_TTL_MINUTES`
 - `SERVER_NAME`
 
 ## Manual Checks
@@ -321,6 +362,9 @@ Live Ops quick check:
 ```bash
 curl -k -i "https://127.0.0.1:8443/api/events/snapshot?since_id=0&limit=20"
 curl -k -i https://127.0.0.1:8443/api/events/stream
+curl -k -i https://127.0.0.1:8443/api/events/live-mode
+curl -k -i "https://127.0.0.1:8443/api/metrics/trends?window=24h&route=__all__"
+curl -k -i https://127.0.0.1:8443/openapi.json
 ```
 
 ## Performance Benchmarking
@@ -392,6 +436,7 @@ For final showcase steps (server start, load profile, dashboard flow), use:
 
 - `docs/demo-runbook.md` - Technical demo steps
 - `docs/demo-recruiter.md` - 2-minute recruiter script with timing and shareable URL
+- `docs/api-examples.md` - auth/session, trends, incidents, and OpenAPI curls
 
 For Cursor Cloud Agents with Computer Use:
 
