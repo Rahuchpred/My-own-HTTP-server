@@ -23,7 +23,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO
 
+from auth_store import AuthStore
 from config import (
+    AUTH_USERS_FILE,
     CLI_REFRESH_MS_DEFAULT,
     DEFAULT_CHAOS_SEED,
     DEMO_TOKEN,
@@ -55,6 +57,10 @@ from config import (
     MAX_SCENARIOS,
     MAX_STEPS_PER_SCENARIO,
     MAX_TARGETS,
+    METRICS_BACKEND,
+    METRICS_FLUSH_INTERVAL_SECS,
+    METRICS_RETENTION_DAYS,
+    METRICS_SQLITE_FILE,
     PORT,
     PUBLIC_BASE_URL,
     REDIRECT_HTTP_TO_HTTPS,
@@ -63,6 +69,7 @@ from config import (
     SCENARIO_STATE_FILE,
     SELECT_TIMEOUT_SECS,
     SERVER_ENGINE,
+    SESSION_TTL_MINUTES,
     SHUTDOWN_POLL_INTERVAL_SECS,
     SOCKET_TIMEOUT_SECS,
     STATE_FILE,
@@ -76,6 +83,7 @@ from dynamic_mock_dispatch import response_from_mock
 from event_hub import EventHub
 from handlers.example_handlers import home, serve_static, stream_demo, submit
 from metrics import MetricsRegistry
+from metrics_store import create_metrics_store
 from playground_api import PlaygroundAPI
 from playground_store import PlaygroundStore
 from request import KNOWN_METHODS, HTTPRequest, HTTPRequestParseError
@@ -84,6 +92,7 @@ from router import Router
 from scenario_api import ScenarioAPI
 from scenario_engine import ScenarioEngine
 from scenario_store import ScenarioStore
+from session_store import SessionStore
 from socket_handler import (
     HeaderTooLargeError,
     MalformedRequestError,
@@ -100,6 +109,9 @@ from target_store import utc_now as target_utc_now
 from thread_pool import ThreadPool
 
 logger = logging.getLogger(__name__)
+
+ROLE_RANK = {"viewer": 1, "operator": 2, "admin": 3}
+WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
 @dataclass(slots=True)
@@ -253,6 +265,12 @@ class HTTPServer:
         demo_token: str = DEMO_TOKEN,
         require_demo_token: bool = REQUIRE_DEMO_TOKEN,
         public_base_url: str = PUBLIC_BASE_URL,
+        metrics_backend: str = METRICS_BACKEND,
+        metrics_sqlite_file: str = METRICS_SQLITE_FILE,
+        metrics_retention_days: int = METRICS_RETENTION_DAYS,
+        metrics_flush_interval_secs: int = METRICS_FLUSH_INTERVAL_SECS,
+        auth_users_file: str = AUTH_USERS_FILE,
+        session_ttl_minutes: int = SESSION_TTL_MINUTES,
         codecrafters_mode: bool = False,
         files_directory: str | None = None,
     ) -> None:
@@ -289,11 +307,22 @@ class HTTPServer:
         self.demo_token = demo_token
         self.require_demo_token = require_demo_token
         self.public_base_url = public_base_url
+        self.metrics_retention_days = max(1, int(metrics_retention_days))
+        self.metrics_flush_interval_secs = max(1, int(metrics_flush_interval_secs))
+        self.auth_users_file = auth_users_file
+        self.session_ttl_minutes = max(1, int(session_ttl_minutes))
         self.codecrafters_mode = codecrafters_mode
         self.files_directory = (
             Path(files_directory).resolve() if files_directory is not None else None
         )
         self.enable_incident_mode = ENABLE_INCIDENT_MODE
+        self._metrics_worker_thread: threading.Thread | None = None
+        self._auth_store = AuthStore(users_file=self.auth_users_file)
+        self._session_store = SessionStore(ttl_minutes=self.session_ttl_minutes)
+        self._metrics_store = create_metrics_store(
+            backend=metrics_backend,
+            sqlite_file=metrics_sqlite_file,
+        )
 
         self.tls_config = TLSConfig(
             enabled=enable_tls,
@@ -319,7 +348,7 @@ class HTTPServer:
         self._incident_lock = threading.Lock()
         self._incident_profile = IncidentProfile()
         self._incident_request_seq = 0
-        self.metrics = MetricsRegistry()
+        self.metrics = MetricsRegistry(trend_store=self._metrics_store)
         self.metrics.set_incident_state(state="inactive", profile="none")
         self.event_hub: EventHub | None = (
             EventHub(buffer_size=event_buffer_size) if self.enable_live_events else None
@@ -491,12 +520,41 @@ class HTTPServer:
                 pass
         return f"https://{host}:{self.https_port}{target}"
 
+    def _start_metrics_worker(self) -> None:
+        if self._metrics_worker_thread is not None and self._metrics_worker_thread.is_alive():
+            return
+
+        def _run() -> None:
+            while self._running:
+                time.sleep(self.metrics_flush_interval_secs)
+                self._session_store.prune_expired()
+                self.metrics.flush_trends()
+                self.metrics.prune_trends(retention_days=self.metrics_retention_days)
+            self.metrics.flush_trends()
+
+        self._metrics_worker_thread = threading.Thread(
+            target=_run,
+            daemon=True,
+            name="metrics-trends-worker",
+        )
+        self._metrics_worker_thread.start()
+
+    def _stop_metrics_worker(self) -> None:
+        thread = self._metrics_worker_thread
+        if thread is None:
+            return
+        self._running = False
+        if thread.is_alive():
+            thread.join(timeout=self.metrics_flush_interval_secs + 0.5)
+        self._metrics_worker_thread = None
+
     def start(self) -> None:
         """Start listening and process clients according to selected engine."""
         self._running = True
         self._accepting = True
         self._drain_elapsed_ms = 0.0
         self._set_lifecycle_state("running")
+        self._start_metrics_worker()
         if self.tls_config.enabled:
             self._ssl_context = self._build_ssl_context()
             self.https_port = self.tls_config.https_port
@@ -556,6 +614,8 @@ class HTTPServer:
                     self._pool.shutdown(graceful=True, timeout=self.drain_timeout_secs)
                     self._pool = None
                 self._stop_redirect_listener()
+                self._stop_metrics_worker()
+                self.metrics.close()
                 self._set_lifecycle_state("stopped")
 
     def _start_selectors(self) -> None:
@@ -619,6 +679,8 @@ class HTTPServer:
                 self._selector_connections.clear()
                 self._selector = None
                 self._stop_redirect_listener()
+                self._stop_metrics_worker()
+                self.metrics.close()
                 self._set_lifecycle_state("stopped")
 
     def stop(self) -> None:
@@ -654,6 +716,8 @@ class HTTPServer:
             for state in list(self._selector_connections.values()):
                 self._close_selector_connection(state, self._selector)
             self._selector_connections.clear()
+        self._stop_metrics_worker()
+        self.metrics.flush_trends()
 
     def _update_drain_metrics(self) -> None:
         if self._lifecycle_state != "draining":
@@ -773,29 +837,114 @@ class HTTPServer:
             "/api/proxy/request",
             "/api/events",
             "/api/incidents",
+            "/api/playground",
+            "/api/metrics/trends",
+            "/api/auth/me",
+            "/api/auth/logout",
         )
         return any(path.startswith(prefix) for prefix in protected_prefixes)
 
-    def _is_authorized(self, request: HTTPRequest) -> bool:
-        auth_enabled = self.require_demo_token or bool(self.demo_token)
-        if not auth_enabled:
+    def _auth_enabled(self) -> bool:
+        if self.require_demo_token or bool(self.demo_token):
             return True
+        return self._auth_store.has_users
 
-        expected = self.demo_token
-        if not expected:
-            return False
-
+    def _extract_bearer_token(self, request: HTTPRequest) -> str:
         auth_header = request.headers.get("authorization", "")
         if auth_header.startswith("Bearer "):
-            presented = auth_header.removeprefix("Bearer ").strip()
-            if presented == expected:
-                return True
-
+            return auth_header.removeprefix("Bearer ").strip()
         query_token = request.query_params.get("token", [])
-        if query_token and query_token[0] == expected:
-            return True
+        if query_token:
+            return str(query_token[0]).strip()
+        return ""
 
-        return False
+    def _required_role(self, request: HTTPRequest) -> str | None:
+        path = request.path
+        method = request.method
+
+        if path == "/api/auth/login":
+            return None
+        if path in {"/api/auth/me", "/api/auth/logout"}:
+            return "viewer"
+        if path == "/api/metrics/trends":
+            return "viewer"
+        if path.startswith("/api/events/"):
+            return "viewer"
+        if path == "/api/playground/state":
+            return "viewer"
+        if path == "/api/history":
+            return "viewer"
+        if path == "/api/incidents/state":
+            return "viewer"
+        if path in {"/api/incidents/start", "/api/incidents/stop"}:
+            return "operator"
+        if path.startswith("/api/replay/"):
+            return "operator"
+        if path == "/api/playground/request":
+            return "operator"
+        if path == "/api/proxy/request":
+            return "operator"
+
+        if path == "/api/targets" or path.startswith("/api/targets/"):
+            if method in {"GET", "HEAD"}:
+                return "viewer"
+            return "admin"
+
+        if path == "/api/mocks" or path.startswith("/api/mocks/"):
+            if method in {"GET", "HEAD"}:
+                return "viewer"
+            return "admin"
+
+        if path == "/api/scenarios":
+            if method in {"GET", "HEAD"}:
+                return "viewer"
+            return "admin"
+
+        if path.startswith("/api/scenarios/"):
+            if path.endswith("/run"):
+                return "operator"
+            if path.endswith("/runs"):
+                return "viewer"
+            if path.startswith("/api/scenarios/runs/"):
+                return "viewer"
+            if method in {"GET", "HEAD"}:
+                return "viewer"
+            return "admin"
+
+        if self._is_protected_path(path):
+            if method in WRITE_METHODS:
+                return "admin"
+            return "viewer"
+        return None
+
+    def _authorized_role(self, request: HTTPRequest) -> tuple[str, str]:
+        token = self._extract_bearer_token(request)
+        if token and self.demo_token and token == self.demo_token:
+            return "admin", "demo_token"
+
+        session = self._session_store.get(token) if token else None
+        if session is not None:
+            role = str(session.get("role", "viewer")).strip().lower()
+            username = str(session.get("username", ""))
+            if role not in ROLE_RANK:
+                role = "viewer"
+            return role, username
+
+        if not self._auth_enabled():
+            return "admin", "open_mode"
+        return "", ""
+
+    def _authorize_request(self, request: HTTPRequest) -> HTTPResponse | None:
+        required_role = self._required_role(request)
+        if required_role is None:
+            return None
+
+        role, _principal = self._authorized_role(request)
+        if not role:
+            return self._unauthorized_response()
+        if ROLE_RANK.get(role, 0) < ROLE_RANK.get(required_role, 0):
+            return self._forbidden_response()
+        return None
 
     def _unauthorized_response(self) -> HTTPResponse:
         return HTTPResponse(
@@ -803,6 +952,133 @@ class HTTPServer:
             headers={"Content-Type": "application/json"},
             body=json.dumps({"error": {"code": "unauthorized", "message": "unauthorized"}}),
         )
+
+    def _forbidden_response(self) -> HTTPResponse:
+        return HTTPResponse(
+            status_code=403,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps({"error": {"code": "forbidden", "message": "forbidden"}}),
+        )
+
+    def _handle_auth_request(self, request: HTTPRequest) -> HTTPResponse:
+        if request.path == "/api/auth/login":
+            if request.method != "POST":
+                return HTTPResponse(
+                    status_code=405,
+                    headers={"Allow": "POST", "Content-Type": "application/json"},
+                    body=json.dumps(
+                        {
+                            "error": {
+                                "code": "method_not_allowed",
+                                "message": "method not allowed",
+                            }
+                        }
+                    ),
+                )
+            if not self._auth_store.has_users:
+                return HTTPResponse(
+                    status_code=503,
+                    headers={"Content-Type": "application/json"},
+                    body=json.dumps(
+                        {
+                            "error": {
+                                "code": "auth_unavailable",
+                                "message": "no auth users configured",
+                            }
+                        }
+                    ),
+                )
+            payload, error = self._read_json_payload(request)
+            if error is not None:
+                return error
+            username = str(payload.get("username", "")).strip()
+            password = str(payload.get("password", ""))
+            if not username or not password:
+                return self._targets_response(
+                    400,
+                    {
+                        "error": {
+                            "code": "invalid_credentials",
+                            "message": "username and password are required",
+                        }
+                    },
+                )
+            ok, role = self._auth_store.authenticate(username, password)
+            if not ok:
+                return self._targets_response(
+                    401,
+                    {
+                        "error": {
+                            "code": "invalid_credentials",
+                            "message": "invalid username or password",
+                        }
+                    },
+                )
+            session = self._session_store.create(username=username, role=role)
+            return self._targets_response(
+                200,
+                {
+                    "session": {
+                        "token": session["token"],
+                        "username": session["username"],
+                        "role": session["role"],
+                        "expires_at": session["expires_at"],
+                    }
+                },
+            )
+
+        if request.path == "/api/auth/me":
+            if request.method not in {"GET", "HEAD"}:
+                return HTTPResponse(
+                    status_code=405,
+                    headers={"Allow": "GET, HEAD", "Content-Type": "application/json"},
+                    body=json.dumps(
+                        {
+                            "error": {
+                                "code": "method_not_allowed",
+                                "message": "method not allowed",
+                            }
+                        }
+                    ),
+                )
+            role, principal = self._authorized_role(request)
+            if not role:
+                return self._unauthorized_response()
+            return self._targets_response(
+                200,
+                {
+                    "auth": {
+                        "username": principal or "anonymous",
+                        "role": role,
+                    }
+                },
+            )
+
+        if request.path == "/api/auth/logout":
+            if request.method != "POST":
+                return HTTPResponse(
+                    status_code=405,
+                    headers={"Allow": "POST", "Content-Type": "application/json"},
+                    body=json.dumps(
+                        {
+                            "error": {
+                                "code": "method_not_allowed",
+                                "message": "method not allowed",
+                            }
+                        }
+                    ),
+                )
+            token = self._extract_bearer_token(request)
+            if not token:
+                return self._unauthorized_response()
+            if self.demo_token and token == self.demo_token:
+                return self._targets_response(200, {"logged_out": True})
+            revoked = self._session_store.revoke(token)
+            if not revoked and self._auth_enabled():
+                return self._unauthorized_response()
+            return self._targets_response(200, {"logged_out": True})
+
+        return HTTPResponse(status_code=404, body="Not Found")
 
     def _incident_state_payload(self) -> dict[str, object]:
         with self._incident_lock:
@@ -1038,6 +1314,93 @@ class HTTPServer:
             return max(1, min(1000, int(values[0])))
         except ValueError:
             return default
+
+    def _events_live_mode_payload(self) -> dict[str, object]:
+        available = True
+        reason = ""
+        if self.event_hub is None:
+            available = False
+            reason = "live_events_disabled"
+        elif self.live_events_require_selectors and self.engine != "selectors":
+            available = False
+            reason = "use_selectors_engine"
+        refresh_ms = max(1000, int(self.cli_refresh_ms_default))
+        return {
+            "available": available,
+            "engine": self.engine,
+            "required_engine": "selectors" if self.live_events_require_selectors else self.engine,
+            "reason": reason,
+            "fallback": {
+                "mode": "snapshot_polling",
+                "refresh_ms": refresh_ms,
+            },
+            "actions": {
+                "retry": True,
+                "recommended_command": "python3 server.py --engine selectors",
+            },
+        }
+
+    def _events_live_mode_response(self) -> HTTPResponse:
+        return HTTPResponse(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(self._events_live_mode_payload(), sort_keys=True),
+        )
+
+    def _parse_window_seconds(self, raw_window: str) -> int:
+        value = raw_window.strip().lower()
+        if not value:
+            return 24 * 60 * 60
+        if value.endswith("m"):
+            try:
+                return max(60, int(value[:-1]) * 60)
+            except ValueError:
+                return 24 * 60 * 60
+        if value.endswith("h"):
+            try:
+                return max(60, int(value[:-1]) * 60 * 60)
+            except ValueError:
+                return 24 * 60 * 60
+        if value.endswith("d"):
+            try:
+                return max(60, int(value[:-1]) * 24 * 60 * 60)
+            except ValueError:
+                return 24 * 60 * 60
+        try:
+            return max(60, int(value))
+        except ValueError:
+            return 24 * 60 * 60
+
+    def _metrics_trends_response(self, request: HTTPRequest) -> HTTPResponse:
+        route_key = "__all__"
+        raw_route = request.query_params.get("route", [])
+        if raw_route and raw_route[0].strip():
+            route_key = raw_route[0].strip()
+        raw_window = ""
+        raw_window_values = request.query_params.get("window", [])
+        if raw_window_values:
+            raw_window = raw_window_values[0]
+        window_seconds = self._parse_window_seconds(raw_window)
+        trends = self.metrics.query_trends(
+            window_seconds=window_seconds,
+            route_key=route_key,
+        )
+        return HTTPResponse(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            body=json.dumps(
+                {
+                    "window": raw_window or "24h",
+                    "window_seconds": window_seconds,
+                    "route": route_key,
+                    "backend": self._metrics_store.backend_name,
+                    "points": trends["points"],
+                    "summary": trends["summary"],
+                    "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                },
+                sort_keys=True,
+            ),
+        )
 
     def _events_snapshot_response(self, request: HTTPRequest) -> HTTPResponse:
         if self.event_hub is None:
@@ -2020,6 +2383,19 @@ class HTTPServer:
     def _serve_playground_minimal_page(self, *, as_head: bool) -> HTTPResponse:
         return self._serve_html_page("playground-minimal.html", as_head=as_head)
 
+    def _serve_openapi_document(self, *, as_head: bool) -> HTTPResponse:
+        openapi_path = Path("openapi") / "openapi.json"
+        if not openapi_path.exists() or not openapi_path.is_file():
+            return HTTPResponse(status_code=404, body="Not Found")
+        response = HTTPResponse(
+            status_code=200,
+            headers={"Content-Type": "application/json"},
+            file_path=openapi_path,
+        )
+        if as_head:
+            return self._as_head_response(response)
+        return response
+
     def _read_json_payload(
         self,
         request: HTTPRequest,
@@ -2377,11 +2753,27 @@ class HTTPServer:
     def _dispatch(self, request: HTTPRequest) -> HTTPResponse:
         if request.method not in KNOWN_METHODS:
             return HTTPResponse(status_code=501, body="Not Implemented")
-        if self._is_protected_path(request.path) and not self._is_authorized(request):
-            return self._unauthorized_response()
+        auth_error = self._authorize_request(request)
+        if auth_error is not None:
+            return auth_error
         compatibility_response = self._dispatch_codecrafters_base(request)
         if compatibility_response is not None:
             return compatibility_response
+
+        if request.path == "/openapi.json":
+            if request.method not in {"GET", "HEAD"}:
+                return HTTPResponse(
+                    status_code=405,
+                    headers={"Allow": "GET, HEAD"},
+                    body="Method Not Allowed",
+                )
+            return self._serve_openapi_document(as_head=request.method == "HEAD")
+
+        if request.path.startswith("/api/auth/"):
+            response = self._handle_auth_request(request)
+            if request.method == "HEAD":
+                return self._as_head_response(response)
+            return response
 
         if request.path == "/_metrics":
             if request.method not in {"GET", "HEAD"}:
@@ -2401,6 +2793,28 @@ class HTTPServer:
             if request.method == "HEAD":
                 return self._as_head_response(metrics_response)
             return metrics_response
+        if request.path == "/api/metrics/trends":
+            if request.method not in {"GET", "HEAD"}:
+                return HTTPResponse(
+                    status_code=405,
+                    headers={"Allow": "GET, HEAD"},
+                    body="Method Not Allowed",
+                )
+            trends_response = self._metrics_trends_response(request)
+            if request.method == "HEAD":
+                return self._as_head_response(trends_response)
+            return trends_response
+        if request.path == "/api/events/live-mode":
+            if request.method not in {"GET", "HEAD"}:
+                return HTTPResponse(
+                    status_code=405,
+                    headers={"Allow": "GET, HEAD"},
+                    body="Method Not Allowed",
+                )
+            live_mode_response = self._events_live_mode_response()
+            if request.method == "HEAD":
+                return self._as_head_response(live_mode_response)
+            return live_mode_response
         if request.path == "/api/events/snapshot":
             if request.method not in {"GET", "HEAD"}:
                 return HTTPResponse(
@@ -2832,6 +3246,16 @@ def _parse_args() -> argparse.Namespace:
         default=REQUIRE_DEMO_TOKEN,
     )
     parser.add_argument("--public-base-url", default=PUBLIC_BASE_URL)
+    parser.add_argument("--metrics-backend", choices=["memory", "sqlite"], default=METRICS_BACKEND)
+    parser.add_argument("--metrics-sqlite-file", default=METRICS_SQLITE_FILE)
+    parser.add_argument("--metrics-retention-days", type=int, default=METRICS_RETENTION_DAYS)
+    parser.add_argument(
+        "--metrics-flush-interval-secs",
+        type=int,
+        default=METRICS_FLUSH_INTERVAL_SECS,
+    )
+    parser.add_argument("--auth-users-file", default=AUTH_USERS_FILE)
+    parser.add_argument("--session-ttl-minutes", type=int, default=SESSION_TTL_MINUTES)
     args = parser.parse_args()
     if args.port is None:
         args.port = 4221 if args.codecrafters_mode else PORT
@@ -2885,6 +3309,12 @@ if __name__ == "__main__":
         demo_token=args.demo_token,
         require_demo_token=args.require_demo_token,
         public_base_url=args.public_base_url,
+        metrics_backend=args.metrics_backend,
+        metrics_sqlite_file=args.metrics_sqlite_file,
+        metrics_retention_days=args.metrics_retention_days,
+        metrics_flush_interval_secs=args.metrics_flush_interval_secs,
+        auth_users_file=args.auth_users_file,
+        session_ttl_minutes=args.session_ttl_minutes,
         codecrafters_mode=args.codecrafters_mode,
         files_directory=args.directory,
     )

@@ -54,6 +54,12 @@ MAX_TARGETS: int = 50
 DEMO_TOKEN: str = os.getenv("DEMO_TOKEN", "")
 REQUIRE_DEMO_TOKEN: bool = os.getenv("REQUIRE_DEMO_TOKEN", "false").lower() == "true"
 PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "")
+METRICS_BACKEND: str = os.getenv("METRICS_BACKEND", "sqlite")
+METRICS_SQLITE_FILE: str = os.getenv("METRICS_SQLITE_FILE", "data/metrics.sqlite3")
+METRICS_RETENTION_DAYS: int = int(os.getenv("METRICS_RETENTION_DAYS", "30"))
+METRICS_FLUSH_INTERVAL_SECS: int = int(os.getenv("METRICS_FLUSH_INTERVAL_SECS", "10"))
+AUTH_USERS_FILE: str = os.getenv("AUTH_USERS_FILE", "data/auth_users.json")
+SESSION_TTL_MINUTES: int = int(os.getenv("SESSION_TTL_MINUTES", "480"))
 LIVE_EVENTS_REQUIRE_SELECTORS: bool = True
 ENABLE_INCIDENT_MODE: bool = True
 INCIDENT_DEFAULT_PROBABILITY: float = 0.5

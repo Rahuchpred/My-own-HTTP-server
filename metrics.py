@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections import Counter
+
+from metrics_store import MetricsTrendStore, summarize_points
 
 LATENCY_BUCKETS_MS = (5, 10, 25, 50, 100, 250, 500, 1000, 2000, 5000)
 
 
 class MetricsRegistry:
-    def __init__(self) -> None:
+    def __init__(self, *, trend_store: MetricsTrendStore | None = None) -> None:
         self._lock = threading.Lock()
         self._total_requests = 0
         self._active_connections = 0
@@ -42,6 +45,8 @@ class MetricsRegistry:
         self._incident_state = "inactive"
         self._incident_profile = "none"
         self._incident_faults_total = 0
+        self._trend_store = trend_store
+        self._trend_backend = trend_store.backend_name if trend_store is not None else "memory"
 
     def connection_opened(self) -> None:
         with self._lock:
@@ -89,6 +94,13 @@ class MetricsRegistry:
                     del latencies[: len(latencies) - 4096]
             if trace_id is not None:
                 self._last_request_trace_id = trace_id
+        if self._trend_store is not None:
+            self._trend_store.record_request(
+                route_key=route_key or "-",
+                status_code=status_code,
+                duration_ms=duration_ms,
+                observed_at=time.time(),
+            )
 
     def record_read_error(self, error_type: str) -> None:
         with self._lock:
@@ -198,7 +210,33 @@ class MetricsRegistry:
                 "incident_state": self._incident_state,
                 "incident_profile": self._incident_profile,
                 "incident_faults_total": self._incident_faults_total,
+                "metrics_backend": self._trend_backend,
             }
+
+    def flush_trends(self) -> None:
+        if self._trend_store is not None:
+            self._trend_store.flush()
+
+    def prune_trends(self, *, retention_days: int) -> None:
+        if self._trend_store is None:
+            return
+        days = max(1, retention_days)
+        cutoff = int(time.time()) - (days * 24 * 60 * 60)
+        self._trend_store.prune_older_than(cutoff_epoch=cutoff)
+
+    def query_trends(self, *, window_seconds: int, route_key: str) -> dict[str, object]:
+        if self._trend_store is None:
+            empty_points: list[dict[str, object]] = []
+            return {"points": empty_points, "summary": summarize_points(empty_points)}
+        points = self._trend_store.query(
+            window_seconds=max(60, window_seconds),
+            route_key=route_key,
+        )
+        return {"points": points, "summary": summarize_points(points)}
+
+    def close(self) -> None:
+        if self._trend_store is not None:
+            self._trend_store.close()
 
     def _bucket_label(self, duration_ms: float) -> str:
         for limit in LATENCY_BUCKETS_MS:
