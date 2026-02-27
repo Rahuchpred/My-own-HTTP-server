@@ -538,6 +538,8 @@ def test_playground_html_includes_demo_mode_and_live_controls(tmp_path: Path) ->
     body = response.split(b"\r\n\r\n", 1)[1]
     assert b"Enable Live Mode" in body
     assert b"Demo Presets" in body
+    assert b"Live SLO (server)" in body
+    assert b"Mission SLO (last run)" in body
 
 
 def test_playground_js_has_fallback_and_enable_live_mode_hooks() -> None:
@@ -547,3 +549,8 @@ def test_playground_js_has_fallback_and_enable_live_mode_hooks() -> None:
     assert "startSnapshotFallback" in script
     assert "/api/events/live-mode" in script
     assert "DEMO_PRESETS" in script
+    assert "missionLifecycle" in script
+    assert "Mission blocked" in script
+    assert "Fault changed. Run a mission to evaluate impact." in script
+    assert "missionRequiresAdminBootstrap" in script
+    assert "summarizeMissionLatency" in script
