@@ -35,6 +35,7 @@ const els = {
   healthBadge: document.getElementById("healthBadge"),
   cursorBadge: document.getElementById("cursorBadge"),
   currentRoleText: document.getElementById("currentRoleText"),
+  switchRoleBtn: document.getElementById("switchRoleBtn"),
   enableLiveModeBtn: document.getElementById("enableLiveModeBtn"),
   liveModeHint: document.getElementById("liveModeHint"),
 
@@ -1260,6 +1261,12 @@ function bindEvents() {
     els.enableLiveModeBtn.addEventListener("click", () => {
       appState.reconnectAttempts = 0
       void startEventStream(true)
+    })
+  }
+
+  if (els.switchRoleBtn) {
+    els.switchRoleBtn.addEventListener("click", () => {
+      showTokenModal(true)
     })
   }
 

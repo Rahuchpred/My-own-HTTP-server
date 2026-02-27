@@ -113,6 +113,12 @@ body {
   font-size: 12px;
 }
 
+.role-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
 .badge {
   border: 1px solid var(--line);
   background: #fff;
