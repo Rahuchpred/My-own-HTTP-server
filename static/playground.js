@@ -3,11 +3,14 @@ const MAX_HISTORY_ITEMS = 80
 
 const appState = {
   authState: "checking",
+  authRole: "",
   streamState: "connecting",
+  streamTransport: "sse",
   diagnostics: [],
   lastEventId: 0,
   eventSource: null,
   reconnectTimer: null,
+  fallbackTimer: null,
   reconnectAttempts: 0,
   eventIndex: new Map(),
   timeline: [],
@@ -20,6 +23,9 @@ const appState = {
   history: [],
   incident: null,
   metrics: {},
+  trendsSummary: {},
+  activePreset: null,
+  liveMode: null,
 }
 
 const els = {
@@ -28,6 +34,8 @@ const els = {
   eventsBadge: document.getElementById("eventsBadge"),
   healthBadge: document.getElementById("healthBadge"),
   cursorBadge: document.getElementById("cursorBadge"),
+  enableLiveModeBtn: document.getElementById("enableLiveModeBtn"),
+  liveModeHint: document.getElementById("liveModeHint"),
 
   incidentMode: document.getElementById("incidentMode"),
   incidentProbability: document.getElementById("incidentProbability"),
@@ -35,6 +43,8 @@ const els = {
   startIncidentBtn: document.getElementById("startIncidentBtn"),
   stopIncidentBtn: document.getElementById("stopIncidentBtn"),
   incidentState: document.getElementById("incidentState"),
+  presetHint: document.getElementById("presetHint"),
+  runPresetBtn: document.getElementById("runPresetBtn"),
 
   verdictCard: document.getElementById("verdictCard"),
   analysisPanel: document.getElementById("analysisPanel"),
@@ -89,6 +99,9 @@ const els = {
   historyList: document.getElementById("historyList"),
 
   tokenModal: document.getElementById("tokenModal"),
+  usernameInput: document.getElementById("usernameInput"),
+  passwordInput: document.getElementById("passwordInput"),
+  loginBtn: document.getElementById("loginBtn"),
   tokenInput: document.getElementById("tokenInput"),
   saveTokenBtn: document.getElementById("saveTokenBtn"),
   clearTokenBtn: document.getElementById("clearTokenBtn"),
@@ -208,16 +221,38 @@ const MISSION_PRESETS = {
   },
 }
 
+const DEMO_PRESETS = {
+  beginner: {
+    label: "Beginner",
+    mission: "signup_chaos",
+    incident: { mode: "fixed_latency", probability: 0.0, latency_ms: 120 },
+    hint: "Low-chaos mode for clean walkthroughs and stable outputs.",
+  },
+  ops: {
+    label: "Ops",
+    mission: "checkout_latency",
+    incident: { mode: "fixed_latency", probability: 0.25, latency_ms: 600 },
+    hint: "Balanced observability mode with moderate latency and clear diagnostics.",
+  },
+  chaos: {
+    label: "Chaos",
+    mission: "upstream_outage",
+    incident: { mode: "status_spike_503", probability: 0.45, latency_ms: 0 },
+    hint: "Stress mode for outage and recovery storytelling.",
+  },
+}
+
 function getToken() {
-  return window.localStorage.getItem("demoToken") || ""
+  return window.localStorage.getItem("authToken") || window.localStorage.getItem("demoToken") || ""
 }
 
 function setToken(token) {
   if (!token) {
+    window.localStorage.removeItem("authToken")
     window.localStorage.removeItem("demoToken")
     return
   }
-  window.localStorage.setItem("demoToken", token)
+  window.localStorage.setItem("authToken", token)
 }
 
 function withAuthHeaders(headers = {}) {
@@ -251,12 +286,52 @@ function showTokenModal(show = true) {
   }
 }
 
+function setLiveModeHint(text) {
+  if (!els.liveModeHint) return
+  els.liveModeHint.textContent = text
+}
+
+function roleRank(role) {
+  if (role === "admin") return 3
+  if (role === "operator") return 2
+  if (role === "viewer") return 1
+  return 0
+}
+
+function updateControlPermissions() {
+  const rank = roleRank(appState.authRole)
+  const canOperate = rank >= 2
+  const canAdmin = rank >= 3
+
+  document.querySelectorAll("[data-mission]").forEach((button) => {
+    button.disabled = !canOperate
+  })
+  document.querySelectorAll("[data-preset]").forEach((button) => {
+    button.disabled = !canOperate
+  })
+
+  if (els.startIncidentBtn) els.startIncidentBtn.disabled = !canOperate
+  if (els.stopIncidentBtn) els.stopIncidentBtn.disabled = !canOperate
+  if (els.sendBtn) els.sendBtn.disabled = !canOperate
+  if (els.runScenarioBtn) els.runScenarioBtn.disabled = !canOperate
+  if (els.runPresetBtn) els.runPresetBtn.disabled = !canOperate
+
+  if (els.createMockBtn) els.createMockBtn.disabled = !canAdmin
+  if (els.createTargetBtn) els.createTargetBtn.disabled = !canAdmin
+}
+
 function updateStatusBadges() {
   const authKind = appState.authState === "connected" ? "ok" : appState.authState === "checking" ? "warn" : "bad"
-  const streamKind = appState.streamState === "connected" ? "ok" : appState.streamState === "reconnecting" ? "warn" : "bad"
+  const streamKind =
+    appState.streamState === "connected"
+      ? "ok"
+      : appState.streamState === "reconnecting" || appState.streamState === "fallback"
+        ? "warn"
+        : "bad"
   const healthKind = appState.incident && appState.incident.active ? "bad" : "ok"
 
-  setBadge(els.authBadge, `auth: ${appState.authState}`, authKind)
+  const authLabel = appState.authRole ? `${appState.authState}(${appState.authRole})` : appState.authState
+  setBadge(els.authBadge, `auth: ${authLabel}`, authKind)
   setBadge(els.eventsBadge, `events: ${appState.streamState}`, streamKind)
   setBadge(els.healthBadge, `health: ${appState.incident && appState.incident.active ? "degraded" : "healthy"}`, healthKind)
 }
@@ -267,8 +342,10 @@ function setAuthState(nextState) {
   }
   appState.authState = nextState
   updateStatusBadges()
+  updateControlPermissions()
   if (nextState === "unauthorized") {
-    addDiagnostic("Protected APIs returned 401. Token is missing or invalid.", "warn")
+    appState.authRole = ""
+    addDiagnostic("Protected APIs returned 401. Login or token is required.", "warn")
     showTokenModal(true)
   }
 }
@@ -453,33 +530,43 @@ function renderIncidentState() {
 
 function renderScoreboard() {
   const metrics = appState.metrics || {}
+  const trends = appState.trendsSummary || {}
   const latest = appState.latestRun
   const reliability = latest && latest.analysis ? latest.analysis.reliability_score : "-"
 
-  let p50 = 0
-  let p95 = 0
-  let routeCount = 0
-  const latencyByRoute = metrics.latency_by_route_ms || {}
-  for (const key of Object.keys(latencyByRoute)) {
-    p50 += Number(latencyByRoute[key].p50 || 0)
-    p95 += Number(latencyByRoute[key].p95 || 0)
-    routeCount += 1
+  let p50 = Number(trends.p50 || 0)
+  let p95 = Number(trends.p95 || 0)
+  let p99 = Number(trends.p99 || 0)
+  if (Number(trends.request_count || 0) <= 0) {
+    let routeCount = 0
+    const latencyByRoute = metrics.latency_by_route_ms || {}
+    for (const key of Object.keys(latencyByRoute)) {
+      p50 += Number(latencyByRoute[key].p50 || 0)
+      p95 += Number(latencyByRoute[key].p95 || 0)
+      routeCount += 1
+    }
+    if (routeCount > 0) {
+      p50 = p50 / routeCount
+      p95 = p95 / routeCount
+    }
+    p99 = Number(metrics.latency_p99_ms || 0)
   }
-  if (routeCount > 0) {
-    p50 = p50 / routeCount
-    p95 = p95 / routeCount
-  }
-  const p99 = Number(metrics.latency_p99_ms || 0)
 
   const runsTotal = Number(metrics.scenario_runs_total || 0)
   const runsPassed = Number(metrics.scenario_runs_passed || 0)
   const passRate = runsTotal > 0 ? (runsPassed / runsTotal) * 100 : 0
 
-  const statusCounts = metrics.status_counts || {}
-  const totalRequests = Number(metrics.total_requests || 0)
-  const fiveXx = Object.keys(statusCounts)
-    .filter((code) => code.startsWith("5"))
-    .reduce((sum, code) => sum + Number(statusCounts[code] || 0), 0)
+  let totalRequests = Number(metrics.total_requests || 0)
+  let fiveXx = 0
+  if (Number(trends.request_count || 0) > 0) {
+    totalRequests = Number(trends.request_count || 0)
+    fiveXx = Number(trends.status_5xx || 0)
+  } else {
+    const statusCounts = metrics.status_counts || {}
+    fiveXx = Object.keys(statusCounts)
+      .filter((code) => code.startsWith("5"))
+      .reduce((sum, code) => sum + Number(statusCounts[code] || 0), 0)
+  }
   const burn = totalRequests > 0 ? (fiveXx / totalRequests) * 100 : 0
 
   els.scoreReliability.textContent = String(reliability)
@@ -585,6 +672,51 @@ function handleLiveEvent(event) {
   updateServiceMap()
 }
 
+function applyDemoPreset(presetId) {
+  const preset = DEMO_PRESETS[presetId]
+  if (!preset) {
+    return
+  }
+  appState.activePreset = presetId
+  if (els.incidentMode) els.incidentMode.value = preset.incident.mode
+  if (els.incidentProbability) els.incidentProbability.value = String(preset.incident.probability)
+  if (els.incidentLatency) els.incidentLatency.value = String(preset.incident.latency_ms)
+  if (els.presetHint) {
+    els.presetHint.textContent = [
+      `preset: ${preset.label}`,
+      `recommended_mission: ${preset.mission}`,
+      `incident: mode=${preset.incident.mode}, probability=${preset.incident.probability}, latency_ms=${preset.incident.latency_ms}`,
+      `hint: ${preset.hint}`,
+    ].join("\n")
+  }
+  addDiagnostic(`preset applied: ${preset.label}`, "info")
+}
+
+async function runActivePresetMission() {
+  if (!appState.activePreset) {
+    addDiagnostic("choose a preset first (Beginner, Ops, or Chaos)", "warn")
+    return
+  }
+  const preset = DEMO_PRESETS[appState.activePreset]
+  if (!preset) {
+    return
+  }
+  await runMission(preset.mission)
+}
+
+async function fetchLiveModeStatus() {
+  const response = await fetchJson("/api/events/live-mode")
+  if (!response.ok) {
+    return {
+      available: false,
+      reason: `status_${response.status}`,
+      fallback: { mode: "snapshot_polling", refresh_ms: 1500 },
+      actions: { retry: true, recommended_command: "python3 server.py --engine selectors" },
+    }
+  }
+  return response.data
+}
+
 async function fetchEventSnapshot() {
   const token = getToken()
   const query = new URLSearchParams({
@@ -614,6 +746,11 @@ async function fetchEventSnapshot() {
   }
   if (!response.ok) {
     addDiagnostic(`events snapshot failed with status ${response.status}`, "error")
+    if (response.status === 409) {
+      appState.streamState = "fallback"
+      updateStatusBadges()
+      setLiveModeHint("Snapshot fallback active. Selectors engine is required for SSE.")
+    }
     return
   }
 
@@ -626,6 +763,29 @@ async function fetchEventSnapshot() {
   }
 }
 
+function stopSnapshotFallback() {
+  if (appState.fallbackTimer) {
+    clearTimeout(appState.fallbackTimer)
+    appState.fallbackTimer = null
+  }
+}
+
+function startSnapshotFallback(refreshMs, reasonText) {
+  stopSnapshotFallback()
+  appState.streamState = "fallback"
+  appState.streamTransport = "snapshot_polling"
+  updateStatusBadges()
+  if (reasonText) {
+    setLiveModeHint(reasonText)
+  }
+
+  const runTick = async () => {
+    await fetchEventSnapshot()
+    appState.fallbackTimer = window.setTimeout(runTick, Math.max(750, Number(refreshMs || 1500)))
+  }
+  appState.fallbackTimer = window.setTimeout(runTick, 0)
+}
+
 function stopEventStream() {
   if (appState.eventSource) {
     appState.eventSource.close()
@@ -635,10 +795,30 @@ function stopEventStream() {
     clearTimeout(appState.reconnectTimer)
     appState.reconnectTimer = null
   }
+  stopSnapshotFallback()
 }
 
-function startEventStream() {
+async function startEventStream(forceRetry = false) {
   stopEventStream()
+  const liveMode = await fetchLiveModeStatus()
+  appState.liveMode = liveMode
+  const fallbackMs = Number((liveMode.fallback && liveMode.fallback.refresh_ms) || 1500)
+  if (!liveMode.available) {
+    const reason =
+      liveMode.reason === "use_selectors_engine"
+        ? `Selectors engine is required. Run: ${(liveMode.actions && liveMode.actions.recommended_command) || "python3 server.py --engine selectors"}`
+        : `Live stream unavailable (${liveMode.reason || "unknown"})`
+    addDiagnostic(`${reason}. Switched to snapshot fallback.`, "warn")
+    setLiveModeHint(`${reason}. Fallback mode is active.`)
+    startSnapshotFallback(fallbackMs, `${reason}. Fallback mode is active.`)
+    return
+  }
+
+  if (forceRetry) {
+    setLiveModeHint("Retrying live SSE mode...")
+  } else {
+    setLiveModeHint("Starting live SSE mode...")
+  }
 
   const token = getToken()
   const query = new URLSearchParams({
@@ -661,6 +841,7 @@ function startEventStream() {
   }
 
   appState.streamState = "connecting"
+  appState.streamTransport = "sse"
   updateStatusBadges()
 
   const source = new EventSource(`/api/events/stream?${query.toString()}`)
@@ -693,37 +874,59 @@ function startEventStream() {
 
   source.onopen = () => {
     appState.streamState = "connected"
+    appState.streamTransport = "sse"
     appState.reconnectAttempts = 0
+    stopSnapshotFallback()
+    setLiveModeHint("Live mode connected (SSE).")
     updateStatusBadges()
   }
 
   source.onerror = async () => {
     appState.reconnectAttempts += 1
-    appState.streamState = appState.reconnectAttempts > 4 ? "degraded" : "reconnecting"
+    appState.streamState = appState.reconnectAttempts > 4 ? "fallback" : "reconnecting"
     updateStatusBadges()
     addDiagnostic(`event stream interrupted (attempt ${appState.reconnectAttempts})`, "warn")
     stopEventStream()
     await fetchEventSnapshot()
 
+    if (appState.reconnectAttempts > 4) {
+      const reason = "SSE degraded, switched to snapshot fallback."
+      setLiveModeHint(`${reason} Click Enable Live Mode to retry.`)
+      startSnapshotFallback(fallbackMs, `${reason} Click Enable Live Mode to retry.`)
+      return
+    }
+
     appState.reconnectTimer = window.setTimeout(
       () => {
-        startEventStream()
+        void startEventStream(true)
       },
-      appState.reconnectAttempts > 4 ? 4000 : 1200,
+      1200,
     )
   }
 }
 
 async function fetchState() {
-  const [metricsRes, stateRes, targetsRes, scenariosRes, incidentRes] = await Promise.all([
+  const [metricsRes, trendsRes, authRes, stateRes, targetsRes, scenariosRes, incidentRes] = await Promise.all([
     fetchJson("/_metrics"),
+    fetchJson("/api/metrics/trends?window=24h&route=__all__"),
+    fetchJson("/api/auth/me"),
     fetchJson("/api/playground/state"),
     fetchJson("/api/targets"),
     fetchJson("/api/scenarios"),
     fetchJson("/api/incidents/state"),
   ])
 
-  if (stateRes.status === 401 || targetsRes.status === 401 || scenariosRes.status === 401 || incidentRes.status === 401) {
+  if (authRes.ok) {
+    appState.authRole = String((authRes.data.auth && authRes.data.auth.role) || "")
+    setAuthState("connected")
+    showTokenModal(false)
+  } else if (
+    stateRes.status === 401 ||
+    targetsRes.status === 401 ||
+    scenariosRes.status === 401 ||
+    incidentRes.status === 401 ||
+    authRes.status === 401
+  ) {
     setAuthState("unauthorized")
   } else {
     setAuthState("connected")
@@ -733,6 +936,9 @@ async function fetchState() {
     appState.metrics = metricsRes.data || {}
     const engine = appState.metrics.engine || "-"
     setBadge(els.engineBadge, `engine: ${engine}`, "ok")
+  }
+  if (trendsRes.ok) {
+    appState.trendsSummary = trendsRes.data.summary || {}
   }
 
   if (stateRes.ok) {
@@ -753,6 +959,7 @@ async function fetchState() {
   renderScoreboard()
   updateServiceMap()
   updateStatusBadges()
+  updateControlPermissions()
 }
 
 function renderManualRun(run) {
@@ -1028,7 +1235,58 @@ async function runSelectedScenario() {
 
 function bindEvents() {
   document.querySelectorAll("[data-mission]").forEach((button) => {
-    button.addEventListener("click", () => runMission(button.getAttribute("data-mission")))
+    button.addEventListener("click", () => {
+      void runMission(button.getAttribute("data-mission"))
+    })
+  })
+
+  document.querySelectorAll("[data-preset]").forEach((button) => {
+    button.addEventListener("click", () => {
+      applyDemoPreset(button.getAttribute("data-preset"))
+    })
+  })
+
+  if (els.runPresetBtn) {
+    els.runPresetBtn.addEventListener("click", () => {
+      void runActivePresetMission()
+    })
+  }
+
+  if (els.enableLiveModeBtn) {
+    els.enableLiveModeBtn.addEventListener("click", () => {
+      appState.reconnectAttempts = 0
+      void startEventStream(true)
+    })
+  }
+
+  if (els.loginBtn) {
+    els.loginBtn.addEventListener("click", async () => {
+      const username = (els.usernameInput && els.usernameInput.value ? els.usernameInput.value : "").trim()
+      const password = els.passwordInput && els.passwordInput.value ? els.passwordInput.value : ""
+      const response = await fetchJson("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      })
+      if (!response.ok) {
+        addDiagnostic(
+          `login failed (${response.status}): ${(response.data.error && response.data.error.message) || "unauthorized"}`,
+          "error",
+        )
+        return
+      }
+      const token = (response.data.session && response.data.session.token) || ""
+      if (!token) {
+        addDiagnostic("login succeeded but no token returned", "error")
+        return
+      }
+      setToken(token)
+      showTokenModal(false)
+      setAuthState("checking")
+      await fetchState()
+      await fetchEventSnapshot()
+      await startEventStream(true)
+    })
   })
 
   els.saveTokenBtn.addEventListener("click", async () => {
@@ -1038,13 +1296,14 @@ function bindEvents() {
     setAuthState("checking")
     await fetchState()
     await fetchEventSnapshot()
-    startEventStream()
+    await startEventStream(true)
   })
 
   els.clearTokenBtn.addEventListener("click", async () => {
     setToken("")
     setAuthState("unauthorized")
     await fetchState()
+    await fetchEventSnapshot()
   })
 
   els.startIncidentBtn.addEventListener("click", async () => {
@@ -1116,14 +1375,30 @@ function bindEvents() {
   })
 }
 
+function getMissionFromUrl() {
+  const params = new URLSearchParams(window.location.search)
+  const mission = params.get("mission")
+  if (!mission || !MISSION_PRESETS[mission]) return null
+  return mission
+}
+
 async function boot() {
   bindEvents()
   updateStatusBadges()
+  updateControlPermissions()
+  applyDemoPreset("beginner")
   await fetchState()
   await fetchEventSnapshot()
-  startEventStream()
+  await startEventStream()
 
   window.setInterval(fetchState, 7000)
+
+  const autoMission = getMissionFromUrl()
+  if (autoMission) {
+    setTimeout(() => {
+      void runMission(autoMission)
+    }, 2000)
+  }
 }
 
 boot()
