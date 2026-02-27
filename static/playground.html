@@ -100,13 +100,20 @@ state: idle</pre>
       <section class="grid one">
         <article class="panel">
           <h2>SLO Scoreboard</h2>
+          <h3>Live SLO (server)</h3>
           <div class="kpis">
-            <div class="kpi"><span>Reliability Score</span><strong id="scoreReliability">-</strong></div>
-            <div class="kpi"><span>p50 / p95 / p99 (ms)</span><strong id="scoreLatency">-</strong></div>
+            <div class="kpi"><span>p50 / p95 / p99 (ms)</span><strong id="liveScoreLatency">-</strong></div>
+            <div class="kpi"><span>Error Budget Burn</span><strong id="liveScoreBurn">-</strong></div>
+            <div class="kpi"><span>Last Updated</span><strong id="liveScoreUpdated">-</strong></div>
             <div class="kpi"><span>Scenario Pass Rate</span><strong id="scorePassRate">-</strong></div>
-            <div class="kpi"><span>Error Budget Burn</span><strong id="scoreBurn">-</strong></div>
             <div class="kpi"><span>MTTR Proxy</span><strong id="scoreMttr">-</strong></div>
             <div class="kpi"><span>Current Incident</span><strong id="scoreIncident">inactive</strong></div>
+          </div>
+          <h3>Mission SLO (last run)</h3>
+          <div class="kpis">
+            <div class="kpi"><span>Mission Status</span><strong id="missionScoreStatus">No mission run yet</strong></div>
+            <div class="kpi"><span>Reliability Score</span><strong id="missionScoreReliability">No mission run yet</strong></div>
+            <div class="kpi"><span>p50 / p95 / p99 (ms)</span><strong id="missionScoreLatency">No mission run yet</strong></div>
           </div>
           <pre id="comparisonPanel">before/after comparison will appear here.</pre>
         </article>

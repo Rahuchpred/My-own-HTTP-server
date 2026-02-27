@@ -17,7 +17,10 @@ const appState = {
   latestRequest: null,
   latestProxy: null,
   latestRun: null,
+  latestMissionLatency: null,
   lastRecoveryMs: null,
+  missionLifecycle: "idle",
+  liveMetricsUpdatedAt: 0,
   scenarios: [],
   targets: [],
   history: [],
@@ -57,10 +60,13 @@ const els = {
   serviceMap: document.getElementById("serviceMap"),
   diagnosticsPanel: document.getElementById("diagnosticsPanel"),
 
-  scoreReliability: document.getElementById("scoreReliability"),
-  scoreLatency: document.getElementById("scoreLatency"),
+  liveScoreLatency: document.getElementById("liveScoreLatency"),
+  liveScoreBurn: document.getElementById("liveScoreBurn"),
+  liveScoreUpdated: document.getElementById("liveScoreUpdated"),
+  missionScoreStatus: document.getElementById("missionScoreStatus"),
+  missionScoreReliability: document.getElementById("missionScoreReliability"),
+  missionScoreLatency: document.getElementById("missionScoreLatency"),
   scorePassRate: document.getElementById("scorePassRate"),
-  scoreBurn: document.getElementById("scoreBurn"),
   scoreMttr: document.getElementById("scoreMttr"),
   scoreIncident: document.getElementById("scoreIncident"),
   comparisonPanel: document.getElementById("comparisonPanel"),
@@ -163,10 +169,10 @@ const MISSION_PRESETS = {
     incidentStart: {
       mode: "fixed_latency",
       probability: 1.0,
-      latency_ms: 1300,
+      latency_ms: 900,
       seed: 2026,
     },
-    incidentStopAfter: true,
+    dualRunRecovery: true,
     mocks: [
       {
         method: "GET",
@@ -298,6 +304,123 @@ function roleRank(role) {
   if (role === "operator") return 2
   if (role === "viewer") return 1
   return 0
+}
+
+function setVerdictCard(tone, title, subtitle) {
+  const toneClass = tone === "pass" || tone === "fail" ? tone : "neutral"
+  els.verdictCard.classList.remove("pass", "fail", "neutral")
+  els.verdictCard.classList.add(toneClass)
+  els.verdictCard.innerHTML = `<div class="verdict-title">${title}</div><div class="verdict-sub">${subtitle}</div>`
+}
+
+function missionStatusLabel() {
+  const state = appState.missionLifecycle
+  if (state === "running") return "RUNNING"
+  if (state === "blocked_role") return "BLOCKED"
+  if (state === "setup_failed") return "SETUP_FAILED"
+  if (state === "completed_pass") return "PASS"
+  if (state === "completed_fail") return "FAIL"
+  return "No mission run yet"
+}
+
+function percentileFromSorted(values, percentile) {
+  if (!values.length) {
+    return 0
+  }
+  if (values.length === 1) {
+    return Number(values[0]) || 0
+  }
+  const rank = (percentile / 100) * (values.length - 1)
+  const lower = Math.floor(rank)
+  const upper = Math.ceil(rank)
+  if (lower === upper) {
+    return Number(values[lower]) || 0
+  }
+  const weight = rank - lower
+  return (Number(values[lower]) || 0) * (1 - weight) + (Number(values[upper]) || 0) * weight
+}
+
+function summarizeMissionLatency(run) {
+  const latencies = (run.step_results || [])
+    .map((step) => Number(step.latency_ms || 0))
+    .filter((value) => Number.isFinite(value) && value >= 0)
+    .sort((a, b) => a - b)
+  if (!latencies.length) {
+    return null
+  }
+  return {
+    p50: percentileFromSorted(latencies, 50),
+    p95: percentileFromSorted(latencies, 95),
+    p99: percentileFromSorted(latencies, 99),
+  }
+}
+
+function missionRequiresAdminBootstrap(mission) {
+  return Boolean((mission.mocks && mission.mocks.length > 0) || mission.scenario)
+}
+
+function formatMissionError(error) {
+  const raw = String(error || "mission execution failed")
+  if (raw.includes("(403)")) {
+    return "403 forbidden (role restriction). Switch Role -> login as admin -> rerun preset."
+  }
+  if (raw.includes("(401)")) {
+    return "401 unauthorized. Login again and rerun mission."
+  }
+  return raw
+}
+
+function setMissionLifecycle(state, options = {}) {
+  appState.missionLifecycle = state
+
+  if (state === "idle") {
+    setVerdictCard(
+      "neutral",
+      "No mission run yet.",
+      options.subtitle || "Run a mission to generate pass/fail conclusion and root cause.",
+    )
+    if (!options.preservePanels) {
+      els.analysisPanel.textContent = "analysis: -"
+      els.narrativePanel.textContent = "No report yet."
+    }
+  } else if (state === "running") {
+    appState.latestRun = null
+    appState.latestMissionLatency = null
+    setVerdictCard(
+      "neutral",
+      `Running ${options.missionLabel || "mission"}`,
+      options.subtitle || "Preparing mocks, scenario, and incident profile...",
+    )
+    els.analysisPanel.textContent = "analysis: mission running..."
+    els.narrativePanel.textContent = "Mission in progress..."
+  } else if (state === "blocked_role") {
+    appState.latestRun = null
+    appState.latestMissionLatency = null
+    setVerdictCard(
+      "fail",
+      "Mission blocked",
+      options.subtitle || "This mission needs admin role to prepare mocks/scenarios. Click Switch Role.",
+    )
+    els.analysisPanel.textContent = "analysis: state=blocked_role"
+    els.narrativePanel.textContent = "Guided action: Switch Role -> login as admin -> rerun preset."
+  } else if (state === "setup_failed") {
+    appState.latestRun = null
+    appState.latestMissionLatency = null
+    setVerdictCard("fail", options.title || "Mission setup failed", options.subtitle || "Mission setup failed.")
+    els.analysisPanel.textContent = "analysis: state=setup_failed"
+    els.narrativePanel.textContent = options.subtitle || "Mission setup failed."
+  }
+
+  renderScoreboard()
+}
+
+function noteFaultChangedIfNoMission() {
+  if (appState.missionLifecycle !== "idle") {
+    return
+  }
+  setMissionLifecycle("idle", {
+    subtitle: "Fault changed. Run a mission to evaluate impact.",
+  })
 }
 
 function updateControlPermissions() {
@@ -536,8 +659,6 @@ function renderIncidentState() {
 function renderScoreboard() {
   const metrics = appState.metrics || {}
   const trends = appState.trendsSummary || {}
-  const latest = appState.latestRun
-  const reliability = latest && latest.analysis ? latest.analysis.reliability_score : "-"
 
   let p50 = Number(trends.p50 || 0)
   let p95 = Number(trends.p95 || 0)
@@ -574,24 +695,57 @@ function renderScoreboard() {
   }
   const burn = totalRequests > 0 ? (fiveXx / totalRequests) * 100 : 0
 
-  els.scoreReliability.textContent = String(reliability)
-  els.scoreLatency.textContent = `${p50.toFixed(1)} / ${p95.toFixed(1)} / ${p99.toFixed(1)}`
+  const missionState = appState.missionLifecycle
+  const missionHasRun = missionState === "completed_pass" || missionState === "completed_fail"
+  let missionReliability = "No mission run yet"
+  let missionLatency = "No mission run yet"
+  if (missionState === "running") {
+    missionReliability = "running..."
+    missionLatency = "running..."
+  } else if (missionState === "blocked_role") {
+    missionReliability = "blocked (switch role)"
+    missionLatency = "blocked (switch role)"
+  } else if (missionState === "setup_failed") {
+    missionReliability = "setup failed"
+    missionLatency = "setup failed"
+  } else if (missionHasRun) {
+    const reliabilityValue =
+      appState.latestRun && appState.latestRun.analysis
+        ? Number(appState.latestRun.analysis.reliability_score || 0)
+        : 0
+    missionReliability = String(reliabilityValue)
+    if (appState.latestMissionLatency) {
+      missionLatency = `${appState.latestMissionLatency.p50.toFixed(1)} / ${appState.latestMissionLatency.p95.toFixed(
+        1,
+      )} / ${appState.latestMissionLatency.p99.toFixed(1)}`
+    } else {
+      missionLatency = "-"
+    }
+  }
+
+  els.liveScoreLatency.textContent = `${p50.toFixed(1)} / ${p95.toFixed(1)} / ${p99.toFixed(1)}`
+  els.liveScoreBurn.textContent = `${burn.toFixed(2)}%`
+  els.liveScoreUpdated.textContent =
+    appState.liveMetricsUpdatedAt > 0 ? new Date(appState.liveMetricsUpdatedAt).toLocaleTimeString() : "-"
+  els.missionScoreStatus.textContent = missionStatusLabel()
+  els.missionScoreReliability.textContent = missionReliability
+  els.missionScoreLatency.textContent = missionLatency
   els.scorePassRate.textContent = `${passRate.toFixed(1)}%`
-  els.scoreBurn.textContent = `${burn.toFixed(2)}%`
   els.scoreMttr.textContent = appState.lastRecoveryMs == null ? "-" : `${appState.lastRecoveryMs.toFixed(0)}ms`
 }
 
 function renderVerdict(run, missionLabel, comparison = null) {
   appState.latestRun = run
+  appState.latestMissionLatency = summarizeMissionLatency(run)
   const analysis = run.analysis || {}
   const pass = run.status === "pass"
+  appState.missionLifecycle = pass ? "completed_pass" : "completed_fail"
 
-  els.verdictCard.classList.remove("pass", "fail", "neutral")
-  els.verdictCard.classList.add(pass ? "pass" : "fail")
-  els.verdictCard.innerHTML = `
-    <div class="verdict-title">${missionLabel}: ${pass ? "PASS" : "FAIL"}</div>
-    <div class="verdict-sub">${analysis.root_cause_summary || "No root cause summary provided."}</div>
-  `
+  setVerdictCard(
+    pass ? "pass" : "fail",
+    `${missionLabel}: ${pass ? "PASS" : "FAIL"}`,
+    analysis.root_cause_summary || "No root cause summary provided.",
+  )
 
   els.analysisPanel.textContent = JSON.stringify(
     {
@@ -913,7 +1067,7 @@ async function startEventStream(forceRetry = false) {
 async function fetchState() {
   const [metricsRes, trendsRes, authRes, stateRes, targetsRes, scenariosRes, incidentRes] = await Promise.all([
     fetchJson("/_metrics"),
-    fetchJson("/api/metrics/trends?window=24h&route=__all__"),
+    fetchJson("/api/metrics/trends?window=15m&route=__all__"),
     fetchJson("/api/auth/me"),
     fetchJson("/api/playground/state"),
     fetchJson("/api/targets"),
@@ -941,9 +1095,11 @@ async function fetchState() {
     appState.metrics = metricsRes.data || {}
     const engine = appState.metrics.engine || "-"
     setBadge(els.engineBadge, `engine: ${engine}`, "ok")
+    appState.liveMetricsUpdatedAt = Date.now()
   }
   if (trendsRes.ok) {
     appState.trendsSummary = trendsRes.data.summary || {}
+    appState.liveMetricsUpdatedAt = Date.now()
   }
 
   if (stateRes.ok) {
@@ -1100,12 +1256,20 @@ async function runMission(missionId) {
     return
   }
 
-  els.verdictCard.classList.remove("pass", "fail")
-  els.verdictCard.classList.add("neutral")
-  els.verdictCard.innerHTML = `<div class="verdict-title">Running ${mission.label}</div><div class="verdict-sub">Preparing mocks, scenario, and incident profile...</div>`
-
+  setMissionLifecycle("running", {
+    missionLabel: mission.label,
+    subtitle: "Preparing mocks, scenario, and incident profile...",
+  })
   const startedAt = performance.now()
   try {
+    if (missionRequiresAdminBootstrap(mission) && roleRank(appState.authRole) < roleRank("admin")) {
+      const blockedReason = "This mission needs admin role to prepare mocks/scenarios. Click Switch Role."
+      setMissionLifecycle("blocked_role", { subtitle: blockedReason })
+      addDiagnostic(`mission ${mission.label} blocked: ${blockedReason}`, "warn")
+      showTokenModal(true)
+      return
+    }
+
     for (const mock of mission.mocks || []) {
       await ensureMock(mock)
     }
@@ -1120,11 +1284,15 @@ async function runMission(missionId) {
     renderManualRun(beforeRun)
 
     if (mission.dualRunRecovery) {
+      addDiagnostic(`${mission.label}: initial run status=${beforeRun.status}; starting recovery rerun`, "warn")
       await stopIncident()
       const afterRun = await runScenario(scenario.id, Number(mission.seed) + 1)
       renderVerdict(afterRun, mission.label, "fail -> pass recovery complete")
       renderComparison(beforeRun, afterRun)
-      addDiagnostic(`${mission.label} completed with recovery rerun`, "info")
+      addDiagnostic(
+        `${mission.label} completed with recovery rerun (before=${beforeRun.status}, after=${afterRun.status})`,
+        "info",
+      )
     } else {
       renderVerdict(beforeRun, mission.label)
       if (mission.incidentStopAfter) {
@@ -1133,10 +1301,15 @@ async function runMission(missionId) {
       addDiagnostic(`${mission.label} completed`, "info")
     }
   } catch (error) {
-    els.verdictCard.classList.remove("pass", "neutral")
-    els.verdictCard.classList.add("fail")
-    els.verdictCard.innerHTML = `<div class="verdict-title">${mission.label}: execution failed</div><div class="verdict-sub">${String(error)}</div>`
-    addDiagnostic(`mission ${mission.label} failed: ${String(error)}`, "error")
+    const friendlyError = formatMissionError(error)
+    setMissionLifecycle("setup_failed", {
+      title: `${mission.label}: setup failed`,
+      subtitle: friendlyError,
+    })
+    addDiagnostic(`mission ${mission.label} failed: ${friendlyError}`, "error")
+    if (friendlyError.includes("role restriction")) {
+      showTokenModal(true)
+    }
   } finally {
     const elapsedMs = performance.now() - startedAt
     els.comparisonPanel.textContent = `${els.comparisonPanel.textContent}\nlast_mission_elapsed_ms: ${elapsedMs.toFixed(2)}`
@@ -1326,6 +1499,7 @@ function bindEvents() {
         seed: 1337,
       })
       addDiagnostic(`incident started: ${els.incidentMode.value}`, "warn")
+      noteFaultChangedIfNoMission()
       await fetchState()
     } catch (error) {
       addDiagnostic(`incident start failed: ${String(error)}`, "error")
@@ -1336,6 +1510,7 @@ function bindEvents() {
     try {
       await stopIncident()
       addDiagnostic("incident stopped", "info")
+      noteFaultChangedIfNoMission()
       await fetchState()
     } catch (error) {
       addDiagnostic(`incident stop failed: ${String(error)}`, "error")
@@ -1397,6 +1572,7 @@ async function boot() {
   bindEvents()
   updateStatusBadges()
   updateControlPermissions()
+  setMissionLifecycle("idle")
   applyDemoPreset("beginner")
   await fetchState()
   await fetchEventSnapshot()
