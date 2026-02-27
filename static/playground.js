@@ -1287,7 +1287,7 @@ function bindEvents() {
       await fetchEventSnapshot()
       await startEventStream(true)
     })
-  })
+  }
 
   els.saveTokenBtn.addEventListener("click", async () => {
     const token = els.tokenInput.value.trim()
