@@ -68,6 +68,31 @@ body::before {
   color: var(--muted);
 }
 
+.view-switch {
+  margin-top: 12px;
+  display: inline-flex;
+  gap: 8px;
+}
+
+.view-switch a {
+  border: 1px solid var(--line-strong);
+  background: #0c0c0c;
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 0.8rem;
+  padding: 6px 10px;
+}
+
+.view-switch a:hover {
+  border-color: #777;
+  color: var(--text);
+}
+
+.view-switch a.active {
+  color: #fff;
+  border-color: #8a8a8a;
+}
+
 .badges {
   display: flex;
   flex-wrap: wrap;

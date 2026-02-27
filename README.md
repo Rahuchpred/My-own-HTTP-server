@@ -93,6 +93,7 @@ TCP accept ----> | Engine Selector     | ----> threadpool engine
 - `GET /files/{filename}` -> serves file bytes from `--directory` (compatibility mode)
 - `POST /files/{filename}` -> writes request body to file in `--directory` (compatibility mode)
 - `GET /playground` -> API Playground UI
+- `GET /playground-minimal` -> Minimal Playground UI (Inter + Instrument Serif)
 - `GET /static/*` -> serve static files
 - `GET /_metrics` -> JSON metrics snapshot
 - `GET /api/mocks` -> list mock routes

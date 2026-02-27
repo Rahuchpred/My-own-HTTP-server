@@ -178,9 +178,17 @@ def test_playground_blocks_reserved_paths_and_serves_ui(tmp_path: Path, engine: 
             server.port,
             b"GET /playground HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
         )
+        playground_minimal_response = _request(
+            server.host,
+            server.port,
+            b"GET /playground-minimal HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
     finally:
         _stop_server(server, thread)
 
     assert reserved_response.startswith(b"HTTP/1.1 403")
     assert playground_response.startswith(b"HTTP/1.1 200")
     assert b"API Playground" in playground_response
+    assert b"/playground-minimal" in playground_response
+    assert playground_minimal_response.startswith(b"HTTP/1.1 200")
+    assert b"Playground Minimal" in playground_minimal_response

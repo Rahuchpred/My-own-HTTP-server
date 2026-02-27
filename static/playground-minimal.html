@@ -3,20 +3,21 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>API Playground</title>
-    <link rel="stylesheet" href="/static/playground.css" />
+    <title>API Playground Minimal</title>
+    <link rel="stylesheet" href="/static/playground-minimal.css" />
   </head>
   <body>
     <main class="app-shell">
       <header class="topbar">
-        <div>
-          <h1>API Playground</h1>
-          <p>Backend Operations Console: missions, incidents, causality, verdicts.</p>
-          <nav class="view-switch" aria-label="Playground variants">
-            <a href="/playground" class="active">Classic</a>
-            <a href="/playground-minimal">Minimal</a>
-          </nav>
+        <div class="brand">
+          <p class="eyebrow">Backend Operations</p>
+          <h1>Playground Minimal</h1>
+          <p class="subtitle">Fast mission control for chaos tests, requests, and recovery checks.</p>
         </div>
+        <nav class="top-links" aria-label="Playground variants">
+          <a href="/playground-minimal" class="active">Minimal</a>
+          <a href="/playground">Classic</a>
+        </nav>
         <div class="badges">
           <span id="engineBadge" class="badge">engine: -</span>
           <span id="authBadge" class="badge">auth: checking</span>
@@ -29,6 +30,7 @@
       <section class="grid two">
         <article class="panel">
           <h2>Mission Control</h2>
+          <p class="hint">Run a prebuilt mission and observe the timeline update in real time.</p>
           <div class="actions">
             <button data-mission="signup_chaos">User Signup Under Chaos</button>
             <button data-mission="checkout_latency">Checkout Latency Investigation</button>
@@ -45,7 +47,7 @@
             <input id="incidentProbability" type="number" min="0" max="1" step="0.05" value="0.6" />
             <input id="incidentLatency" type="number" min="0" max="10000" step="50" value="2000" />
             <button id="startIncidentBtn">Start Fault</button>
-            <button id="stopIncidentBtn" class="muted">Stop Fault</button>
+            <button id="stopIncidentBtn" class="ghost">Stop Fault</button>
           </div>
           <pre id="incidentState">incident: inactive</pre>
 
@@ -55,13 +57,11 @@
             <div class="verdict-sub">Run a mission to generate pass/fail conclusion and root cause.</div>
           </div>
           <pre id="analysisPanel">analysis: -</pre>
-
-          <h3>Narrative Output</h3>
           <pre id="narrativePanel">No report yet.</pre>
         </article>
 
         <article class="panel">
-          <h2>Live Causality Console</h2>
+          <h2>Live Causality</h2>
           <div class="console-columns">
             <div>
               <h3>Timeline</h3>
@@ -96,7 +96,7 @@ state: idle</pre>
       </section>
 
       <details id="advancedPanel" class="advanced">
-        <summary>Advanced Mode (Raw Request Lab + CRUD)</summary>
+        <summary>Advanced Lab</summary>
         <section class="grid two advanced-grid">
           <article class="panel">
             <h2>Request Lab</h2>
@@ -148,7 +148,7 @@ state: idle</pre>
             <textarea id="mockBody" rows="4">{"ok":true}</textarea>
             <div class="row">
               <button id="createMockBtn">Create / Update Mock</button>
-              <button id="refreshBtn" class="muted">Refresh</button>
+              <button id="refreshBtn" class="ghost">Refresh</button>
             </div>
             <ul id="mocksList" class="list"></ul>
 
@@ -160,14 +160,14 @@ state: idle</pre>
             <div class="row">
               <input id="targetTimeout" type="number" value="5000" min="100" />
               <button id="createTargetBtn">Create Target</button>
-              <button id="refreshTargetsBtn" class="muted">Refresh</button>
+              <button id="refreshTargetsBtn" class="ghost">Refresh</button>
             </div>
             <ul id="targetsList" class="list"></ul>
 
             <h3>Request History</h3>
             <div class="row">
               <input id="historyFilter" type="text" placeholder="Filter by path" />
-              <button id="filterBtn" class="muted">Apply</button>
+              <button id="filterBtn" class="ghost">Apply</button>
             </div>
             <ul id="historyList" class="list"></ul>
           </article>
@@ -178,11 +178,11 @@ state: idle</pre>
     <div id="tokenModal" class="modal hidden">
       <div class="modal-card">
         <h2>Demo Token Required</h2>
-        <p>Protected APIs are locked. Paste Railway demo token once to enable live missions.</p>
+        <p>Protected APIs are locked. Paste your token to enable missions.</p>
         <input id="tokenInput" type="password" placeholder="Paste DEMO_TOKEN" />
         <div class="row">
           <button id="saveTokenBtn">Save Token</button>
-          <button id="clearTokenBtn" class="muted">Clear Token</button>
+          <button id="clearTokenBtn" class="ghost">Clear Token</button>
         </div>
       </div>
     </div>

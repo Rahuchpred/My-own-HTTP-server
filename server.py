@@ -931,6 +931,7 @@ class HTTPServer:
             or path.startswith("/static/")
             or path == "/_metrics"
             or path == "/playground"
+            or path == "/playground-minimal"
         )
 
     def _incident_decision(self, profile: IncidentProfile) -> bool:
@@ -2000,18 +2001,24 @@ class HTTPServer:
             response.headers["X-Request-ID"] = self._new_trace_id()
         return response
 
-    def _serve_playground_page(self, *, as_head: bool) -> HTTPResponse:
-        playground_path = Path("static") / "playground.html"
-        if not playground_path.exists() or not playground_path.is_file():
+    def _serve_html_page(self, filename: str, *, as_head: bool) -> HTTPResponse:
+        page_path = Path("static") / filename
+        if not page_path.exists() or not page_path.is_file():
             return HTTPResponse(status_code=404, body="Not Found")
         response = HTTPResponse(
             status_code=200,
             headers={"Content-Type": "text/html; charset=utf-8"},
-            file_path=playground_path,
+            file_path=page_path,
         )
         if as_head:
             return self._as_head_response(response)
         return response
+
+    def _serve_playground_page(self, *, as_head: bool) -> HTTPResponse:
+        return self._serve_html_page("playground.html", as_head=as_head)
+
+    def _serve_playground_minimal_page(self, *, as_head: bool) -> HTTPResponse:
+        return self._serve_html_page("playground-minimal.html", as_head=as_head)
 
     def _read_json_payload(
         self,
@@ -2442,6 +2449,17 @@ class HTTPServer:
                     body="Method Not Allowed",
                 )
             return self._serve_playground_page(as_head=request.method == "HEAD")
+
+        if request.path == "/playground-minimal":
+            if not self.enable_playground:
+                return HTTPResponse(status_code=404, body="Not Found")
+            if request.method not in {"GET", "HEAD"}:
+                return HTTPResponse(
+                    status_code=405,
+                    headers={"Allow": "GET, HEAD"},
+                    body="Method Not Allowed",
+                )
+            return self._serve_playground_minimal_page(as_head=request.method == "HEAD")
 
         if self._is_api_admin_path(request.path):
             if request.path == "/api/scenarios" or request.path.startswith("/api/scenarios/"):
