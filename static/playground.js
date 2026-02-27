@@ -34,6 +34,7 @@ const els = {
   eventsBadge: document.getElementById("eventsBadge"),
   healthBadge: document.getElementById("healthBadge"),
   cursorBadge: document.getElementById("cursorBadge"),
+  currentRoleText: document.getElementById("currentRoleText"),
   enableLiveModeBtn: document.getElementById("enableLiveModeBtn"),
   liveModeHint: document.getElementById("liveModeHint"),
 
@@ -334,6 +335,9 @@ function updateStatusBadges() {
   setBadge(els.authBadge, `auth: ${authLabel}`, authKind)
   setBadge(els.eventsBadge, `events: ${appState.streamState}`, streamKind)
   setBadge(els.healthBadge, `health: ${appState.incident && appState.incident.active ? "degraded" : "healthy"}`, healthKind)
+  if (els.currentRoleText) {
+    els.currentRoleText.textContent = `Current role: ${appState.authRole || "guest"}`
+  }
 }
 
 function setAuthState(nextState) {

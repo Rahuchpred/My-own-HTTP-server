@@ -99,6 +99,13 @@ body::before {
   gap: 8px;
 }
 
+.role-indicator {
+  display: inline-block;
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
 .badge {
   border: 1px solid var(--line-strong);
   background: #0c0c0c;

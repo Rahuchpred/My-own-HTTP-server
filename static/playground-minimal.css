@@ -107,6 +107,12 @@ body {
   gap: 8px;
 }
 
+.role-indicator {
+  display: inline-block;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .badge {
   border: 1px solid var(--line);
   background: #fff;
